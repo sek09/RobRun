@@ -33,6 +33,7 @@ void LabelStack::FromPoint(float x, float y, float halfHeight)
 namespace {
 
 ImFont* g_espFonts[kMaxEspFontSize + 1]{};
+bool g_nativeEspFontEnabled = true;
 
 ImVec2 Snap(ImVec2 p)
 {
@@ -47,11 +48,16 @@ void RegisterEspFont(int pixelSize, ImFont* font)
 		g_espFonts[pixelSize] = font;
 }
 
+void SetNativeEspFontEnabled(bool enabled)
+{
+	g_nativeEspFontEnabled = enabled;
+}
+
 ImFont* GetEspFont(int pixelSize)
 {
-	if (pixelSize >= kMinEspFontSize && pixelSize <= kMaxEspFontSize && g_espFonts[pixelSize])
+	if (g_nativeEspFontEnabled && pixelSize >= kMinEspFontSize && pixelSize <= kMaxEspFontSize && g_espFonts[pixelSize])
 		return g_espFonts[pixelSize];
-	return ImGui::GetFont(); // Legacy configs below 8 px use the UI font.
+	return ImGui::GetFont(); // Honor other selected fonts and legacy sizes below 8 px.
 }
 
 ImU32 ShadeColour(const D2D1::ColorF& c, float extraAlpha)

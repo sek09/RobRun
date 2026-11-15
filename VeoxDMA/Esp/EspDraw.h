@@ -47,6 +47,7 @@ struct LabelStack {
 constexpr int kMinEspFontSize = 8;
 constexpr int kMaxEspFontSize = 24;
 void RegisterEspFont(int pixelSize, ImFont* font);
+void SetNativeEspFontEnabled(bool enabled);
 ImFont* GetEspFont(int pixelSize);
 
 void DrawOutlinedText(ImDrawList* dl, const ImVec2& pos, ImU32 col,

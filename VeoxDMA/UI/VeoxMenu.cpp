@@ -106,6 +106,8 @@ static void ApplySelectedFont()
 	if (g_fonts[g_fontIndex].ptr)
 		ImGui::GetIO().FontDefault = g_fonts[g_fontIndex].ptr;
 	ConfigInstance.Overlay.FontName = g_fonts[g_fontIndex].name;
+	// Other menu font choices retain their original Player/World ESP appearance.
+	Esp::SetNativeEspFontEnabled(g_fontIndex == 0);
 }
 
 void ApplyPalette()
@@ -2467,19 +2469,6 @@ void Init()
 	font::icomoon = io.Fonts->AddFontFromMemoryTTF(icomoon, sizeof(icomoon), 17.f, &cfg, glyphRanges);
 	font::icomoon_default = io.Fonts->AddFontFromMemoryTTF(icomoon, sizeof(icomoon), 20.f, &cfg, glyphRanges);
 
-	// Bake ESP glyphs at their configured pixel size, instead of resampling a
-	// 15 px UI atlas down to 10-11 px (which blurs small labels).
-	ImFontConfig espCfg = cfg;
-	espCfg.PixelSnapH = true;
-	espCfg.OversampleH = 2;
-	espCfg.OversampleV = 2;
-	for (int px = Esp::kMinEspFontSize; px <= Esp::kMaxEspFontSize; ++px)
-	{
-		ImFont* espFont = io.Fonts->AddFontFromMemoryTTF(inter_medium, sizeof(inter_medium),
-			(float)px, &espCfg, glyphRanges);
-		Esp::RegisterEspFont(px, espFont);
-	}
-
 	if (font::inter_medium_widget)
 		io.FontDefault = font::inter_medium_widget;
 
@@ -2501,6 +2490,26 @@ void Init()
 		{
 			if (std::filesystem::exists(f.path))
 				g_fonts[f.idx].ptr = io.Fonts->AddFontFromFileTTF(f.path.c_str(), 15.f, nullptr, glyphRanges);
+		}
+
+		// Rasterize default ESP labels at the exact user-configured sizes.
+		// Keep this atlas compact: ESP labels do not use the large PUA icon range.
+		static const ImWchar espGlyphRanges[] = { 0x0020, 0x00FF, 0x2000, 0x206F, 0 };
+		ImFontConfig espCfg = cfg;
+		espCfg.PixelSnapH = true;
+		espCfg.OversampleH = 2;
+		espCfg.OversampleV = 2;
+		const std::string espFontPath = (exeDir / "fonts" / "MavenPro-Regular.ttf").string();
+		const bool haveMaven = std::filesystem::exists(espFontPath);
+		for (int px = Esp::kMinEspFontSize; px <= Esp::kMaxEspFontSize; ++px)
+		{
+			ImFont* espFont = haveMaven
+				? io.Fonts->AddFontFromFileTTF(espFontPath.c_str(), (float)px, &espCfg, espGlyphRanges)
+				: nullptr;
+			if (!espFont)
+				espFont = io.Fonts->AddFontFromMemoryTTF(inter_medium, sizeof(inter_medium),
+					(float)px, &espCfg, espGlyphRanges);
+			Esp::RegisterEspFont(px, espFont);
 		}
 
 		g_fontIndex = 0;
