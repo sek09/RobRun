@@ -13,7 +13,7 @@
 
 static ImVec2 MeasureText(const char* text, float size)
 {
-	ImFont* font = ImGui::GetFont();
+	ImFont* font = Esp::GetEspFont((int)size);
 	if (!font) return ImGui::CalcTextSize(text);
 	return font->CalcTextSizeA(size, FLT_MAX, 0.f, text);
 }
@@ -345,6 +345,7 @@ static void DrawOffscreenArrow(ImDrawList* dl, int screenW, int screenH,
 	const Vector3& targetPos, const RobRunCamera::CameraState& cam,
 	float distMeters, ImU32 color, ImFont* font, float fontSize)
 {
+	font = Esp::GetEspFont((int)fontSize - 2);
 	const float cx = (float)screenW * 0.5f;
 	const float cy = (float)screenH * 0.5f;
 	Vector3 toTarget = targetPos - cam.position;
@@ -417,7 +418,7 @@ void DrawPlayers()
 	const ImU32 lookCol = Esp::D2DColorToImU32(pcfg.LookingColour);
 	const ImU32 stateCol = Esp::D2DColorToImU32(pcfg.StateColour);
 	const float fontSize = (float)pcfg.FontSize;
-	ImFont* font = ImGui::GetFont();
+	ImFont* font = Esp::GetEspFont(pcfg.FontSize);
 
 	// --- pose ---------------------------------------------------------
 	// The reader smooths the pose on the worker (EMA over consecutive valid
@@ -555,9 +556,10 @@ void DrawPlayers()
 
 				char hpNum[16];
 				std::snprintf(hpNum, sizeof(hpNum), "%.0f", ent.health);
-				ImVec2 numSz = font ? font->CalcTextSizeA(fontSize - 2.f, FLT_MAX, 0.f, hpNum) : ImGui::CalcTextSize(hpNum);
+				ImFont* hpFont = Esp::GetEspFont((int)fontSize - 2);
+				ImVec2 numSz = hpFont ? hpFont->CalcTextSizeA(fontSize - 2.f, FLT_MAX, 0.f, hpNum) : ImGui::CalcTextSize(hpNum);
 				Esp::DrawOutlinedText(dl, ImVec2(barX - numSz.x - 2.f, maxY - numSz.y),
-					barCol, font, fontSize - 2.f, hpNum);
+					barCol, hpFont, fontSize - 2.f, hpNum);
 			}
 		}
 

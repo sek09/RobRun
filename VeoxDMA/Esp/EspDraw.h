@@ -39,9 +39,16 @@ struct LabelStack {
 	void FromPoint(float x, float y, float halfHeight = 10.f);
 };
 
-// 8-direction outline + colour pass. `col` is the fill. The outline is the
-// same opaque-black cross+diagonals the source uses so letters stay readable
-// on top of bright textures. `pos` is the top-left; the function pixel-snaps.
+// Four-direction outline + colour pass. `col` is the fill. The lighter
+// cardinal outline keeps small rasterized labels readable without muddying
+// glyph edges. `pos` is the top-left; the function pixel-snaps.
+// Font atlas entries baked at native pixel sizes avoid downscaling the
+// default UI font for Player/World ESP labels.
+constexpr int kMinEspFontSize = 8;
+constexpr int kMaxEspFontSize = 24;
+void RegisterEspFont(int pixelSize, ImFont* font);
+ImFont* GetEspFont(int pixelSize);
+
 void DrawOutlinedText(ImDrawList* dl, const ImVec2& pos, ImU32 col,
 	ImFont* font, float size, const char* text);
 

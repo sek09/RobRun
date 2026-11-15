@@ -32,12 +32,27 @@ void LabelStack::FromPoint(float x, float y, float halfHeight)
 
 namespace {
 
+ImFont* g_espFonts[kMaxEspFontSize + 1]{};
+
 ImVec2 Snap(ImVec2 p)
 {
 	return ImVec2(std::floor(p.x + 0.5f), std::floor(p.y + 0.5f));
 }
 
 } // namespace
+
+void RegisterEspFont(int pixelSize, ImFont* font)
+{
+	if (pixelSize >= kMinEspFontSize && pixelSize <= kMaxEspFontSize)
+		g_espFonts[pixelSize] = font;
+}
+
+ImFont* GetEspFont(int pixelSize)
+{
+	if (pixelSize >= kMinEspFontSize && pixelSize <= kMaxEspFontSize && g_espFonts[pixelSize])
+		return g_espFonts[pixelSize];
+	return ImGui::GetFont(); // Legacy configs below 8 px use the UI font.
+}
 
 ImU32 ShadeColour(const D2D1::ColorF& c, float extraAlpha)
 {
@@ -63,11 +78,11 @@ void DrawOutlinedText(ImDrawList* dl, const ImVec2& pos, ImU32 col,
 {
 	if (!text || !text[0] || !font) return;
 	const ImVec2 p = Snap(pos);
-	const ImU32 outline = IM_COL32(0, 0, 0, 220);
-	for (int dy = -1; dy <= 1; ++dy)
-		for (int dx = -1; dx <= 1; ++dx)
-			if (dx || dy)
-				dl->AddText(font, size, ImVec2(p.x + dx, p.y + dy), outline, text);
+	const ImU32 outline = IM_COL32(0, 0, 0, 200);
+	dl->AddText(font, size, ImVec2(p.x - 1.f, p.y), outline, text);
+	dl->AddText(font, size, ImVec2(p.x + 1.f, p.y), outline, text);
+	dl->AddText(font, size, ImVec2(p.x, p.y - 1.f), outline, text);
+	dl->AddText(font, size, ImVec2(p.x, p.y + 1.f), outline, text);
 	dl->AddText(font, size, p, col, text);
 }
 

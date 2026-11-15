@@ -165,7 +165,7 @@ void DrawWorldEntities()
 	const Vector3 localPos = snapshot->localPosition;
 	const bool haveLocalPosition = !localPos.IsZero();
 	ImDrawList* dl = ImGui::GetBackgroundDrawList();
-	ImFont* font = ImGui::GetFont();
+	ImFont* font = Esp::GetEspFont(ConfigInstance.World.FontSize);
 	const float fontSize = (float)ConfigInstance.World.FontSize;
 
 	for (const auto& entity : snapshot->world->entities)

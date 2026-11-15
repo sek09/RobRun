@@ -9,6 +9,7 @@
 #include "../Aim/AimController.h"
 #include "../Overlay/Overlay.h"
 #include "../Esp/Radar.h"
+#include "../Esp/EspDraw.h"
 #include "../Overlay/Backdrop.h"
 #include "imgui_internal.h"
 #include "imgui_settings.h"
@@ -2465,6 +2466,19 @@ void Init()
 	font::inter_bold = io.Fonts->AddFontFromMemoryTTF(inter_bold, sizeof(inter_bold), 16.f, &cfg, glyphRanges);
 	font::icomoon = io.Fonts->AddFontFromMemoryTTF(icomoon, sizeof(icomoon), 17.f, &cfg, glyphRanges);
 	font::icomoon_default = io.Fonts->AddFontFromMemoryTTF(icomoon, sizeof(icomoon), 20.f, &cfg, glyphRanges);
+
+	// Bake ESP glyphs at their configured pixel size, instead of resampling a
+	// 15 px UI atlas down to 10-11 px (which blurs small labels).
+	ImFontConfig espCfg = cfg;
+	espCfg.PixelSnapH = true;
+	espCfg.OversampleH = 2;
+	espCfg.OversampleV = 2;
+	for (int px = Esp::kMinEspFontSize; px <= Esp::kMaxEspFontSize; ++px)
+	{
+		ImFont* espFont = io.Fonts->AddFontFromMemoryTTF(inter_medium, sizeof(inter_medium),
+			(float)px, &espCfg, glyphRanges);
+		Esp::RegisterEspFont(px, espFont);
+	}
 
 	if (font::inter_medium_widget)
 		io.FontDefault = font::inter_medium_widget;
