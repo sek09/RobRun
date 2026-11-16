@@ -228,6 +228,8 @@ bool ProjectWorldAABB(const Projector& project, const Vector3& worldPos,
 	ImVec2& outMin, ImVec2& outMax, float minPx)
 {
 	if (!project) return false;
+	if (!std::isfinite(worldPos.x) || !std::isfinite(worldPos.y) || !std::isfinite(worldPos.z)) return false;
+	if (!std::isfinite(halfWidth) || !std::isfinite(halfHeight) || halfWidth <= 0.f || halfHeight <= 0.f) return false;
 	// Unity is Y-up: halfHeight spans the vertical axis, halfWidth spans X/Z.
 	const Vector3 corners[8] = {
 		Vector3(worldPos.x - halfWidth, worldPos.y - halfHeight, worldPos.z - halfWidth),

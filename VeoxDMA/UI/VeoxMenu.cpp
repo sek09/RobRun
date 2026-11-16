@@ -28,6 +28,8 @@
 #include <filesystem>
 #include <vector>
 
+extern void RequestReattach();
+
 // ---------------------------------------------------------------------------
 // ROB RUN menu.
 //
@@ -305,9 +307,11 @@ void BeginCard(const char* title, float width, float minHeight = 62.f)
 	dl->AddRectFilled(ImVec2(bb.Min.x + 12.f, bb.Min.y + 1.f),
 		ImVec2(bb.Min.x + 44.f, bb.Min.y + 2.5f), C(kAccent, 0.85f), 1.f);
 
+	const char* titleEnd = ImGui::FindRenderedTextEnd(title);
+	std::string displayTitle(title, titleEnd);
 	Text(font::inter_bold,
 		ImVec2(bb.Min.x + 14.f, bb.Min.y + (kCardHeader - font::inter_bold->FontSize) * 0.5f - 1.f),
-		C(kTextDim), title);
+		C(kTextDim), displayTitle.c_str());
 
 	ImGui::SetCursorScreenPos(ImVec2(bb.Min.x, bb.Min.y + kCardHeader));
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(0, 0, 0, 0));
@@ -1021,6 +1025,8 @@ void DrawVisuals()
 		{
 			BeginCard("SKELETON & CHAMS", kCardW);
 			ToggleRow("Draw Skeleton", &ConfigInstance.Player.Skeleton);
+			SliderFloatRow("Bone Thickness", &ConfigInstance.Player.SkeletonThickness, 0.5f, 6.0f, "px");
+			ToggleRow("Head Circle", &ConfigInstance.Player.HeadCircle);
 			ColorToggleRow("Character Chams", &ConfigInstance.Player.Chams, ConfigInstance.Player.ChamsColour);
 			if (ConfigInstance.Player.Chams)
 			{
@@ -1145,6 +1151,7 @@ void DrawVisuals()
 			ToggleRow("First Aid Cabinets", &ConfigInstance.World.FirstAidCabinets);
 			ToggleRow("Crypto Workbenches", &ConfigInstance.World.CryptoWorkbenches);
 			ToggleRow("Vehicle Trunks", &ConfigInstance.World.VehicleTrunks);
+			ToggleRow("Drug Labs", &ConfigInstance.World.DrugWorkbenches);
 			SliderIntRow("Max Distance", &ConfigInstance.World.MaxDistance, 0, 2000, "m");
 			SliderIntRow("Min Cash / Value", &ConfigInstance.World.MinValueFilter, 0, 50000, " $");
 			SliderIntRow("Font Size", &ConfigInstance.World.FontSize, 1, 24, "px");
@@ -1174,6 +1181,7 @@ void DrawRadar()
 		ToggleRow("Show Vehicles", &ConfigInstance.Radar.ShowVehicles);
 		ToggleRow("Show Loot", &ConfigInstance.Radar.ShowLoot);
 		ToggleRow("Rotate With Camera", &ConfigInstance.Radar.RotateWithCamera);
+		ToggleRow("Full Map Window", &ConfigInstance.Radar.PopoutWindow);
 
 		SectionLabel("DISPLAY");
 		SliderFloatRow("Size", &ConfigInstance.Radar.Size, 100.f, 1000.f, "px");
@@ -1336,6 +1344,16 @@ void DrawAim()
 		ToggleRow("Ignore Teammates", &ConfigInstance.Aim.ExpIgnoreTeammates);
 		if (ConfigInstance.Aim.ExpIgnoreTeammates)
 			Note("Uses party membership, not role: same-role players outside your party stay targetable.");
+		{
+			const int tc = (int)ConfigInstance.Aim.TrustedPlayers.size();
+			if (tc > 0) {
+				char buf[64];
+				std::snprintf(buf, sizeof(buf), "Trusted Players: %d", tc);
+				Note("%s  (also skipped by aimbot; manage in Server tab)", buf);
+			} else {
+				Note("No trusted players. Add them in the Server tab.");
+			}
+		}
 		ToggleRow("Show FOV Circle", &ConfigInstance.Aim.ShowFov);
 		ToggleRow("Show Aim Debug", &ConfigInstance.Aim.ShowDebug);
 		EndCard();
@@ -1510,8 +1528,6 @@ void DrawServer()
 	int aliveCount = 0;
 	int deadCount = 0;
 	int partyCount = 0;
-	int64_t totalServerBagValue = 0;
-	int64_t totalServerCash = 0;
 
 	Vector3 effectiveLocalPos = snapshot->localPosition;
 	if (effectiveLocalPos.IsZero() && snapshot->localEntityId >= 0)
@@ -1545,9 +1561,6 @@ void DrawServer()
 		else aliveCount++;
 
 		if (ent.isPartyMember) partyCount++;
-
-		totalServerBagValue += ent.bagValue;
-		totalServerCash += ent.bagCash;
 
 		PlayerItem item;
 		item.ent = &ent;
@@ -1598,8 +1611,6 @@ void DrawServer()
 
 	const char* sortModes[] = {
 		"Distance (Nearest)",
-		"Bag Value (Highest)",
-		"Carried Cash (Highest)",
 		"Health (Lowest)",
 		"Name (A-Z)"
 	};
@@ -1614,20 +1625,10 @@ void DrawServer()
 		break;
 	case 1:
 		std::sort(items.begin(), items.end(), [](const PlayerItem& a, const PlayerItem& b) {
-			return a.ent->bagValue > b.ent->bagValue;
-		});
-		break;
-	case 2:
-		std::sort(items.begin(), items.end(), [](const PlayerItem& a, const PlayerItem& b) {
-			return a.ent->bagCash > b.ent->bagCash;
-		});
-		break;
-	case 3:
-		std::sort(items.begin(), items.end(), [](const PlayerItem& a, const PlayerItem& b) {
 			return a.ent->health < b.ent->health;
 		});
 		break;
-	case 4:
+	case 2:
 		std::sort(items.begin(), items.end(), [](const PlayerItem& a, const PlayerItem& b) {
 			return a.name < b.name;
 		});
@@ -1641,8 +1642,6 @@ void DrawServer()
 		Note("Total Players: %d  (%d alive, %d dead)", totalCount, aliveCount, deadCount);
 		if (partyCount > 0)
 			Note("Party Members: %d", partyCount);
-		Note("Total Server Bag: %s", FormatMoney((std::int32_t)totalServerBagValue).c_str());
-		Note("Total Server Cash: %s", FormatMoney((std::int32_t)totalServerCash).c_str());
 		if (snapshot->spectatorAlert || snapshot->observerCount > 0)
 			Note("Spectators: %d active", snapshot->observerCount);
 		EndCard();
@@ -1667,9 +1666,10 @@ void DrawServer()
 	ImGui::EndGroup();
 
 	const float fullW = g_singleColumn ? kCardW : (kCardW * 2.f + kGap);
+	const float minRosterH = items.empty() ? 80.f : (kCardHeader + 24.f + (float)items.size() * 55.f);
 	char rosterTitle[64];
-	std::snprintf(rosterTitle, sizeof(rosterTitle), "PLAYERS ON MAP (%d / %d)", (int)items.size(), totalCount);
-	BeginCard(rosterTitle, fullW);
+	std::snprintf(rosterTitle, sizeof(rosterTitle), "PLAYERS ON MAP (%d / %d)###srv_roster", (int)items.size(), totalCount);
+	BeginCard(rosterTitle, fullW, minRosterH);
 
 	if (items.empty())
 	{
@@ -1695,7 +1695,7 @@ void DrawServer()
 
 			ImGui::ItemSize(bb);
 			const ImGuiID rowId = window->GetID((int)idx + 2000);
-			if (!ImGui::ItemAdd(bb, rowId)) continue;
+			ImGui::ItemAdd(bb, rowId);
 
 			const bool hov = ImGui::IsMouseHoveringRect(bb.Min, bb.Max);
 
@@ -1804,12 +1804,19 @@ void DrawServer()
 				curX += tw + 4.f;
 			}
 
-			// Line 1 Right: Distance & Bag Value
-			std::string bagStr = FormatMoney(ent.bagValue);
-			const float bagW = TextW(font::inter_medium_widget, bagStr.c_str());
-			dl->AddText(font::inter_medium_widget, font::inter_medium_widget->FontSize,
-				ImVec2(rightX - bagW, line1Y - 1.f), C(kGreen), bagStr.c_str());
+			const bool isTrusted = ent.publicId && ConfigInstance.Aim.TrustedPlayers.count(ent.publicId);
+			if (isTrusted)
+			{
+				const char* tag = "TRUSTED";
+				const ImVec4 tealCol(0.f, 0.8f, 0.65f, 1.f);
+				const float tw = TextW(font::inter_medium_small, tag) + 6.f;
+				dl->AddRectFilled(ImVec2(curX, line1Y), ImVec2(curX + tw, line1Y + 16.f), C(tealCol, 0.22f), 3.f);
+				dl->AddRect(ImVec2(curX, line1Y), ImVec2(curX + tw, line1Y + 16.f), C(tealCol, 0.5f), 3.f);
+				dl->AddText(font::inter_medium_small, font::inter_medium_small->FontSize, ImVec2(curX + 3.f, line1Y + 1.f), C(tealCol), tag);
+				curX += tw + 4.f;
+			}
 
+			// Line 1 Right: Trust button + Distance
 			std::string distStr = item.isLocal ? "0 m" : FormatDistance(item.distance);
 			const float distW = TextW(font::inter_medium_widget, distStr.c_str());
 			ImU32 distCol = C(kTextDim);
@@ -1819,7 +1826,39 @@ void DrawServer()
 				else if (item.distance < 120.f) distCol = IM_COL32(255, 185, 60, 255);
 			}
 			dl->AddText(font::inter_medium_widget, font::inter_medium_widget->FontSize,
-				ImVec2(rightX - bagW - distW - 20.f, line1Y - 1.f), distCol, distStr.c_str());
+				ImVec2(rightX - distW, line1Y - 1.f), distCol, distStr.c_str());
+
+			// Trust / Untrust button (to the left of distance)
+			if (!item.isLocal && ent.publicId)
+			{
+				const char* btnLabel = isTrusted ? "Untrust" : "Trust";
+				const float btnW = TextW(font::inter_medium_small, btnLabel) + 10.f;
+				const float btnH = 16.f;
+				const float btnX = rightX - distW - btnW - 8.f;
+				const ImRect btnRect(ImVec2(btnX, line1Y), ImVec2(btnX + btnW, line1Y + btnH));
+				const bool btnHov = ImGui::IsMouseHoveringRect(btnRect.Min, btnRect.Max);
+
+				const ImVec4 tealCol(0.f, 0.8f, 0.65f, 1.f);
+				if (isTrusted) {
+					dl->AddRectFilled(btnRect.Min, btnRect.Max, C(tealCol, btnHov ? 0.35f : 0.18f), 3.f);
+					dl->AddRect(btnRect.Min, btnRect.Max, C(tealCol, 0.5f), 3.f);
+					dl->AddText(font::inter_medium_small, font::inter_medium_small->FontSize,
+						ImVec2(btnRect.Min.x + 5.f, btnRect.Min.y + 1.f), C(tealCol), btnLabel);
+				} else {
+					dl->AddRectFilled(btnRect.Min, btnRect.Max, C(kTextDim, btnHov ? 0.30f : 0.12f), 3.f);
+					dl->AddRect(btnRect.Min, btnRect.Max, C(kTextDim, 0.4f), 3.f);
+					dl->AddText(font::inter_medium_small, font::inter_medium_small->FontSize,
+						ImVec2(btnRect.Min.x + 5.f, btnRect.Min.y + 1.f), C(kTextDim), btnLabel);
+				}
+
+				if (btnHov && ImGui::IsMouseClicked(0))
+				{
+					if (isTrusted)
+						ConfigInstance.Aim.TrustedPlayers.erase(ent.publicId);
+					else
+						ConfigInstance.Aim.TrustedPlayers.insert(ent.publicId);
+				}
+			}
 
 			// Line 2 Left: Health, Armor, Weapon
 			float l2X = leftX;
@@ -1861,16 +1900,6 @@ void DrawServer()
 					ImVec2(l2X, line2Y), C(kAccentBright), vStr);
 				l2X += TextW(font::inter_medium_small, vStr) + 8.f;
 			}
-
-			// Line 2 Right: Value Breakdown
-			char breakdownBuf[128];
-			std::snprintf(breakdownBuf, sizeof(breakdownBuf), "Cash: %s  |  Items: %s  |  Equip: %s",
-				FormatMoney(ent.bagCash).c_str(),
-				FormatMoney(ent.bagItems).c_str(),
-				FormatMoney(ent.equipValue).c_str());
-			const float breakW = TextW(font::inter_medium_small, breakdownBuf);
-			dl->AddText(font::inter_medium_small, font::inter_medium_small->FontSize,
-				ImVec2(rightX - breakW, line2Y), C(kTextFaint), breakdownBuf);
 		}
 	}
 	EndCard();
@@ -2100,6 +2129,8 @@ void DrawSettings(bool attached, const std::string& statusText)
 				Note("%zu entities | %u skeletons | %u read failures", snapshot->entities.size(),
 					snapshot->skeletonCount, snapshot->failureCount);
 		}
+		if (ButtonRow("", "Re-attach", 130.f, true))
+			RequestReattach();
 		EndCard();
 	}
 	ImGui::EndGroup();

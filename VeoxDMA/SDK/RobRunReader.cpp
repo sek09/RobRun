@@ -6,6 +6,7 @@
 #include "CameraFinder.h"
 #include "CollisionBVH.h"
 #include "ConfigInstance.h"
+#include "DebugLog.h"
 #include <atomic>
 #include <algorithm>
 #include <cctype>
@@ -70,6 +71,32 @@ static std::uint64_t viewRefreshStamp = 0;
 static std::uint64_t cameraResolveStamp = 0;
 static std::uint64_t localChainStamp = 0;
 static std::uint64_t fullResolveStamp = 0;
+static std::string cachedLocationId;
+static std::mutex locationMutex;
+static std::uint64_t locationStamp = 0;
+
+// Caches for immutable entity identity, role and weapon descriptions
+struct SlotIdentityCache {
+    std::wstring nickname;
+    std::wstring clanTag;
+    std::uint64_t publicId = 0;
+    bool valid = false;
+};
+static std::unordered_map<std::uintptr_t, SlotIdentityCache> g_slotIdentityCache;
+
+struct RoleCacheEntry {
+    int roleId = 0;
+    std::string roleName;
+    bool resolved = false;
+};
+static std::unordered_map<std::uintptr_t, RoleCacheEntry> g_roleCache;
+
+struct WeaponDescCache {
+    std::wstring name;
+    int index = -1;
+    bool valid = false;
+};
+static std::unordered_map<std::uintptr_t, WeaponDescCache> g_weaponDescCache;
 
 static void MarkSessionChanged()
 {
@@ -79,6 +106,9 @@ static void MarkSessionChanged()
     cachedViews.clear();
     cachedViewOwner.clear();
     viewOwnerMisses.clear();
+    g_slotIdentityCache.clear();
+    g_roleCache.clear();
+    g_weaponDescCache.clear();
     viewsRefreshed = false;
     slotRefreshStamp = 0;
     viewRefreshStamp = 0;
@@ -227,6 +257,7 @@ struct RigCacheEntry {
     Skeleton::BonePoints smoothedPoints;
     bool smoothedValid = false;
     Vector3 lastSampledPos{};
+    std::vector<Matrix4x4> worldMatrices;
 };
 static std::unordered_map<std::int32_t, RigCacheEntry> rigCache;
 
@@ -237,6 +268,9 @@ static void PruneCaches()
     // the next pass.
     if (rigCache.size() > 1024) rigCache.clear();
     if (detailCache.size() > 1024) detailCache.clear();
+    if (g_slotIdentityCache.size() > 512) g_slotIdentityCache.clear();
+    if (g_roleCache.size() > 512) g_roleCache.clear();
+    if (g_weaponDescCache.size() > 512) g_weaponDescCache.clear();
 }
 
 // Worker-published snapshot. Only the worker writes; any thread may read.
@@ -584,7 +618,9 @@ void Shutdown()
 
 void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
 {
+    DLOG("RobRunReader::Init(ga=0x%llx, up=0x%llx)", (unsigned long long)gameAssemblyBase, (unsigned long long)unityPlayerBase);
     Shutdown();
+    DLOG("RobRunReader::Init: Shutdown done");
 
     gaBase = gameAssemblyBase;
     upBase = unityPlayerBase;
@@ -592,6 +628,7 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
     RobRunCamera::Init(gameAssemblyBase);
     RobRunInventory::Init(gameAssemblyBase);
     RobRunWorld::Init(gameAssemblyBase);
+    DLOG("RobRunReader::Init: sub-inits done");
     cachedGame = 0;
     cachedBattleModel = 0;
     cachedBattleEntities = 0;
@@ -640,6 +677,8 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
     localPosition = Vector3();
     fallbackViewProjection = Matrix4x4{};
     fallbackViewProjectionValid = false;
+    { std::lock_guard<std::mutex> lk(locationMutex); cachedLocationId.clear(); }
+    locationStamp = 0;
 
     g_renderCameraModel.store(0, std::memory_order_relaxed);
     {
@@ -647,15 +686,19 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
         g_freshCamera = RobRunCamera::CameraState{};
     }
 
+    DLOG("RobRunReader::Init: TryLoadBvh");
     TryLoadBvh(true);
+    DLOG("RobRunReader::Init: BVH done, valid=%d", g_bvhScene.valid);
 
     {
         std::lock_guard<std::mutex> lock(g_snapshotMutex);
         g_snapshot = std::make_shared<Snapshot>();
     }
 
+    DLOG("RobRunReader::Init: starting worker threads");
     g_workerStop.store(false, std::memory_order_relaxed);
     g_workerThread = std::thread([] {
+        DLOG("Worker thread started");
         while (!g_workerStop.load(std::memory_order_relaxed)) {
             Update();
             // Adaptive sleep: 1 ms when entities are active to keep snapshots fresh (50-60 Hz),
@@ -666,8 +709,10 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
         }
     });
 
+    DLOG("RobRunReader::Init: main worker launched");
     g_worldWorkerStop.store(false, std::memory_order_relaxed);
     g_worldWorkerThread = std::thread([] {
+        DLOG("World worker thread started");
         while (!g_worldWorkerStop.load(std::memory_order_relaxed)) {
             const std::uintptr_t bm = cachedBattleModel;
             const std::uintptr_t be = cachedBattleEntities;
@@ -691,6 +736,7 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
         }
     });
 
+    DLOG("RobRunReader::Init: complete, both workers launched");
 }
 
 static std::uintptr_t ReadPtr(std::uintptr_t address)
@@ -1067,17 +1113,30 @@ static void ApplyRoleFromWrapper(std::uintptr_t roleWrapper, EntityData& entity)
 {
     if (roleWrapper <= 0x10000) return;
 
+    const auto it = g_roleCache.find(roleWrapper);
+    if (it != g_roleCache.end() && it->second.resolved) {
+        if (!it->second.roleName.empty()) entity.roleName = it->second.roleName;
+        if (it->second.roleId != 0) entity.role = it->second.roleId;
+        return;
+    }
+
     int roleId = 0;
     std::string roleName;
     if (ResolveRoleFromObject(roleWrapper, roleId, roleName)) {
-        if (!roleName.empty()) entity.roleName = std::move(roleName);
+        if (!roleName.empty()) entity.roleName = roleName;
         if (roleId != 0) entity.role = roleId;
-        if (!entity.roleName.empty()) return;
+        if (!entity.roleName.empty()) {
+            g_roleCache[roleWrapper] = RoleCacheEntry{ roleId, roleName, true };
+            return;
+        }
     }
 
     const std::uintptr_t innerPtr = ReadPtr(roleWrapper + rr::ReferenceData::Value);
-    if (innerPtr > 0x10000 && Il2Cpp::ClassOf(innerPtr) != 0)
+    if (innerPtr > 0x10000 && Il2Cpp::ClassOf(innerPtr) != 0) {
+        if (roleId != 0 || !roleName.empty())
+            g_roleCache[roleWrapper] = RoleCacheEntry{ roleId, roleName, true };
         return;
+    }
 
     std::int32_t role = 0;
     if (Il2Cpp::ReadPrimitiveInt(roleWrapper, role)) {
@@ -1087,6 +1146,10 @@ static void ApplyRoleFromWrapper(std::uintptr_t roleWrapper, EntityData& entity)
         } else if (role > 0 && role < 100000) {
             entity.role = role;
         }
+    }
+
+    if (entity.role != 0 || !entity.roleName.empty()) {
+        g_roleCache[roleWrapper] = RoleCacheEntry{ entity.role, entity.roleName, true };
     }
 }
 
@@ -1256,6 +1319,44 @@ static void ReadReloadAndKnockdownState(std::uintptr_t characterModel,
     }
 }
 
+static std::wstring CleanWeaponName(const std::wstring& name)
+{
+    static constexpr std::pair<std::wstring_view, std::wstring_view> table[] = {
+        { L"kl",        L"AK"           },
+        { L"srreaper",  L"AS VAL"       },
+        { L"jp7",       L"MP7"          },
+        { L"mc10",      L"Mac10"        },
+        { L"harris500", L"Pump Shotgun" },
+        { L"cb45",      L"UMP45"        },
+        { L"dp9",       L"Pistol"       },
+        { L"ordr12",    L"SPAZ-12"      },
+        { L"tag12k",    L"TAG-12K"      },
+        { L"lbr44",     L"Revolver"     },
+        { L"rc556",     L"R4C"          },
+        { L"vulture50", L"Deagle"       },
+        { L"apscalar",  L"Vector"       },
+        { L"starh",     L"Scar-H"      },
+        { L"pdw90",     L"P90"          },
+    };
+
+    const size_t pos = name.find(L'_');
+    const std::wstring_view weapName = std::wstring_view(name).substr(0, pos);
+    const std::wstring_view weapTier = (pos != std::wstring::npos)
+        ? std::wstring_view(name).substr(pos + 1) : std::wstring_view{};
+
+    for (const auto& [key, clean] : table) {
+        if (weapName.find(key) != std::wstring_view::npos) {
+            std::wstring result(clean);
+            if (!weapTier.empty()) {
+                result += L" | MK";
+                result += weapTier.substr(1);
+            }
+            return result;
+        }
+    }
+    return {};
+}
+
 static void ReadWeaponName(std::uintptr_t characterModel, std::wstring& out, int& weaponIndex)
 {
     out.clear();
@@ -1272,13 +1373,29 @@ static void ReadWeaponName(std::uintptr_t characterModel, std::wstring& out, int
     if (data <= 0x10000) return;
     const std::uintptr_t description = ReadPtr(data + rr::ReferenceData::Value);
     if (description <= 0x10000) return;
+
+    const auto it = g_weaponDescCache.find(description);
+    if (it != g_weaponDescCache.end() && it->second.valid) {
+        out = it->second.name;
+        weaponIndex = it->second.index;
+        return;
+    }
+
     const std::uintptr_t nameStr = ReadPtr(
         description + rr::Description::Name);
     if (nameStr > 0x10000)
         RobRunMemory::ReadString(nameStr, out);
+    if (!out.empty()) {
+        std::wstring cleaned = CleanWeaponName(out);
+        if (!cleaned.empty()) out = std::move(cleaned);
+    }
     const std::int32_t idx = RobRunMemory::ReadInt32(
         description + rr::InventoryItemDescription::Index);
     if (idx >= 0) weaponIndex = idx;
+
+    if (!out.empty() || weaponIndex >= 0) {
+        g_weaponDescCache[description] = WeaponDescCache{ out, weaponIndex, true };
+    }
 }
 
 // Read a slot identity string. The new offset set stores Il2CppString*
@@ -1293,13 +1410,11 @@ static bool ReadSlotString(std::uintptr_t owner, std::uintptr_t field, std::wstr
     const std::uintptr_t value = ReadPtr(owner + field);
     if (value <= 0x10000) return false;
 
-    if (RobRunMemory::IsClass(value, "String") &&
-        RobRunMemory::ReadString(value, out) && !out.empty())
+    if (RobRunMemory::ReadString(value, out) && !out.empty())
         return true;
 
     const std::uintptr_t wrapped = ReadPtr(value + rr::BattleCharacterSlotData::wrapper_value);
     if (wrapped > 0x10000 && wrapped != value &&
-        RobRunMemory::IsClass(wrapped, "String") &&
         RobRunMemory::ReadString(wrapped, out) && !out.empty())
         return true;
 
@@ -1311,31 +1426,41 @@ static void ReadSlotIdentity(std::uintptr_t slotValue, EntityData& entity)
 {
     if (slotValue <= 0x10000) return;
 
-    // New offset set: the dictionary value is BattleCharacterSlotData itself.
-    ReadSlotString(slotValue, rr::BattleCharacterSlotData::Nickname, entity.nickname);
-    ReadSlotString(slotValue, rr::BattleCharacterSlotData::ClanTag, entity.clanTag);
+    const auto it = g_slotIdentityCache.find(slotValue);
+    if (it != g_slotIdentityCache.end() && it->second.valid) {
+        entity.nickname = it->second.nickname;
+        entity.clanTag = it->second.clanTag;
+        entity.publicId = it->second.publicId;
+        return;
+    }
 
-    // The party filter compares public ids, so read it from the same object.
-    const std::int64_t publicId = RobRunMemory::ReadInt64(
-        slotValue + rr::BattleCharacterSlotData::PublicId);
-    if (publicId > 0) entity.publicId = static_cast<std::uint64_t>(publicId);
+    std::uintptr_t slotData = slotValue;
+    const std::uintptr_t dataCandidate = ReadPtr(slotValue + rr::BattleCharacterSlotModel::_data);
+    if (dataCandidate > 0x10000 && dataCandidate != slotValue) {
+        slotData = dataCandidate;
+    }
 
-    // Legacy: the dictionary value is BattleCharacterSlotModel, which points at
-    // its data object at +0x10.
-    if (entity.nickname.empty() || entity.clanTag.empty() || entity.publicId == 0) {
-        const std::uintptr_t slotData = ReadPtr(
-            slotValue + rr::BattleCharacterSlotModel::_data);
-        if (slotData > 0x10000 && slotData != slotValue) {
-            if (entity.nickname.empty())
-                ReadSlotString(slotData, rr::BattleCharacterSlotData::Nickname, entity.nickname);
-            if (entity.clanTag.empty())
-                ReadSlotString(slotData, rr::BattleCharacterSlotData::ClanTag, entity.clanTag);
-            if (entity.publicId == 0) {
-                const std::int64_t legacyId = RobRunMemory::ReadInt64(
-                    slotData + rr::BattleCharacterSlotData::PublicId);
-                if (legacyId > 0) entity.publicId = static_cast<std::uint64_t>(legacyId);
-            }
+    ReadSlotString(slotData, rr::BattleCharacterSlotData::Nickname, entity.nickname);
+    ReadSlotString(slotData, rr::BattleCharacterSlotData::ClanTag, entity.clanTag);
+
+    const std::uintptr_t pubWrap = ReadPtr(slotData + rr::BattleCharacterSlotData::PublicId);
+    if (pubWrap > 0x10000) {
+        const std::int64_t val = RobRunMemory::ReadInt64(pubWrap + 0x18);
+        if (val > 0)
+            entity.publicId = static_cast<std::uint64_t>(val);
+        else {
+            const std::int64_t raw = RobRunMemory::ReadInt64(slotData + rr::BattleCharacterSlotData::PublicId);
+            if (raw > 0) entity.publicId = static_cast<std::uint64_t>(raw);
         }
+    } else {
+        const std::int64_t raw = RobRunMemory::ReadInt64(slotData + rr::BattleCharacterSlotData::PublicId);
+        if (raw > 0) entity.publicId = static_cast<std::uint64_t>(raw);
+    }
+
+    if (entity.publicId > 0 || !entity.nickname.empty()) {
+        g_slotIdentityCache[slotValue] = SlotIdentityCache{
+            entity.nickname, entity.clanTag, entity.publicId, true
+        };
     }
 }
 
@@ -1673,6 +1798,9 @@ static void RevalidateSession()
 
 static void UpdateInternal()
 {
+    static int uiCount = 0;
+    ++uiCount;
+
     entities.clear();
     localEntityId = -1;
     localPosition = Vector3{};
@@ -1680,12 +1808,13 @@ static void UpdateInternal()
     fallbackViewProjectionValid = false;
     poseFailureCount = 0;
 
-    if (!gaBase) return;
+    if (!gaBase) { if (uiCount <= 3) DLOG("UpdateInternal #%d: no gaBase", uiCount); return; }
 
     ++updateCounter;
     if ((updateCounter % 120) == 0)
         RevalidateSession();
 
+    static int gameResolveFails = 0;
     if (!cachedGame) {
         if (gameRetryCountdown <= 0) {
             cachedGame = ResolveGameViaGom();
@@ -1693,10 +1822,24 @@ static void UpdateInternal()
             // fails (menu/loading screen) back off instead of walking 8k nodes
             // on every pass.
             gameRetryCountdown = cachedGame ? 0 : 30;
+            if (!cachedGame) {
+                // ~300 attempts × 30-pass backoff ≈ 5 minutes of total failure.
+                // The DTB may have gone stale; attempt a re-fix once.
+                if (++gameResolveFails >= 300) {
+                    gameResolveFails = 0;
+                    TargetProcess.FixCr3();
+                }
+            } else {
+                gameResolveFails = 0;
+            }
         } else {
             --gameRetryCountdown;
         }
+    } else {
+        gameResolveFails = 0;
     }
+
+    if (uiCount <= 3) DLOG("UpdateInternal #%d: game=0x%llx", uiCount, (unsigned long long)cachedGame);
 
     if (!cachedBattleModel)
         cachedBattleModel = ResolveBattleModel(cachedGame);
@@ -1742,6 +1885,25 @@ static void UpdateInternal()
         NoteSessionState();
         ++failureCount;
         return;
+    }
+
+    {
+        const std::uint64_t locNow = GetTickCount64();
+        if (locationStamp == 0 || locNow - locationStamp >= 5000) {
+            locationStamp = locNow;
+            const std::uintptr_t settings = ReadPtr(
+                cachedBattleModel + rr::BattleModel::BattleSettings);
+            if (settings > 0x10000) {
+                const std::uintptr_t idStr = ReadPtr(
+                    settings + rr::BattleSettingsDescription::Id);
+                std::wstring wide;
+                if (RobRunMemory::ReadString(idStr, wide)) {
+                    std::string id = RobRunMemory::WideToUtf8(wide);
+                    std::lock_guard<std::mutex> lk(locationMutex);
+                    cachedLocationId = std::move(id);
+                }
+            }
+        }
     }
 
     {
@@ -1848,14 +2010,15 @@ static void UpdateInternal()
             (viewRefreshStamp == 0 || viewNow - viewRefreshStamp >= 400))
         {
             viewRefreshStamp = viewNow;
-            cachedViews.clear();
             const std::uintptr_t viewDictionary = ReadPtr(
                 cachedUpdater + rr::BattleEntitiesUpdater::_characterEntityViews);
             std::vector<RobRunMemory::DictEntry> viewEntries;
             if (RobRunMemory::ReadDictInt(viewDictionary, viewEntries)) {
-                cachedViews.reserve(viewEntries.size());
+                std::unordered_map<std::int32_t, std::uintptr_t> fresh;
+                fresh.reserve(viewEntries.size());
                 for (const auto& entry : viewEntries)
-                    cachedViews[entry.key] = entry.value;
+                    fresh[entry.key] = entry.value;
+                cachedViews.swap(fresh);
             }
             // Match after this pass's player positions exist (end of pass);
             // matching here would only see the previous list, which is cleared
@@ -1867,38 +2030,69 @@ static void UpdateInternal()
 
     {
         const std::uint64_t slotNow = GetTickCount64();
-        if (slotRefreshStamp == 0 || slotNow - slotRefreshStamp >= 5000)
+        if (slotRefreshStamp == 0 || slotNow - slotRefreshStamp >= 3000)
         {
             slotRefreshStamp = slotNow;
-            cachedSlots.clear();
 
             std::vector<RobRunMemory::DictEntry> slotEntries;
             bool slotsRead = false;
 
+            // 1. ClientCharacterSlotsModel on BattleModel (+0x248) -> _slotByEntityId (+0x18)
             const std::uintptr_t slotsModel = ReadPtr(
                 cachedBattleModel + rr::BattleModel::CharacterSlotsModel);
             if (slotsModel > 0x10000) {
                 std::uintptr_t slotDictionary = ReadPtr(
                     slotsModel + rr::CharacterSlotsModel::SlotDict);
                 slotsRead = RobRunMemory::ReadDictInt(slotDictionary, slotEntries);
-                if (!slotsRead) {
+                if (!slotsRead || slotEntries.empty()) {
                     slotDictionary = ReadPtr(
                         slotsModel + rr::CharacterSlotsModel::SlotDictLegacy);
                     slotsRead = RobRunMemory::ReadDictInt(slotDictionary, slotEntries);
                 }
             }
 
-            if (!slotsRead) {
-                const std::uintptr_t legacyModel = ReadPtr(
-                    cachedBattleModel + rr::BattleModel::CharacterSlotsModelLegacy);
-                if (legacyModel > 0x10000) {
-                    std::uintptr_t slotDictionary = ReadPtr(
-                        legacyModel + rr::CharacterSlotsModel::SlotDictLegacy);
-                    slotsRead = RobRunMemory::ReadDictInt(slotDictionary, slotEntries);
+            // 2. ClientCharacterSlotsModel via TypeInfo static singleton
+            if (!slotsRead || slotEntries.empty()) {
+                const std::uintptr_t typeInfo = ReadPtr(gaBase + rr::TypeInfo::ClientCharacterSlotsModel);
+                if (typeInfo > 0x10000) {
+                    const std::uintptr_t statics = ReadPtr(typeInfo + rr::Klass::static_fields);
+                    if (statics > 0x10000) {
+                        const std::uintptr_t clientSlots = ReadPtr(statics);
+                        if (clientSlots > 0x10000) {
+                            const std::uintptr_t slotDict = ReadPtr(clientSlots + rr::CharacterSlotsModel::SlotDict);
+                            slotsRead = RobRunMemory::ReadDictInt(slotDict, slotEntries);
+                        }
+                    }
                 }
             }
 
-            if (!slotsRead) {
+            // 3. BattleCharacterSlotsModel on BattleModel (+0x4D0)
+            if (!slotsRead || slotEntries.empty()) {
+                const std::uintptr_t battleSlotsModel = ReadPtr(
+                    cachedBattleModel + rr::BattleModel::CharacterSlotsModelLegacy);
+                if (battleSlotsModel > 0x10000) {
+                    std::uintptr_t slotDict = ReadPtr(battleSlotsModel + 0x18);
+                    if (slotDict <= 0x10000) slotDict = ReadPtr(battleSlotsModel + 0x10);
+                    std::vector<RobRunMemory::RefDictEntry> refEntries;
+                    if (RobRunMemory::ReadDictRef(slotDict, refEntries) && !refEntries.empty()) {
+                        for (const auto& re : refEntries) {
+                            if (re.value <= 0x10000) continue;
+                            const std::uintptr_t slotData = ReadPtr(re.value + rr::BattleCharacterSlotModel::_data);
+                            if (slotData > 0x10000) {
+                                const std::uintptr_t entityIdWrap = ReadPtr(slotData + rr::BattleCharacterSlotData::EntityId);
+                                std::int32_t entId = -1;
+                                if (entityIdWrap > 0x10000 && Il2Cpp::ReadPrimitiveInt(entityIdWrap, entId) && entId >= 0) {
+                                    slotEntries.push_back({ 0, 0, entId, 0, re.value });
+                                    slotsRead = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. BattleEntitiesModel CharacterSlotsRoot fallback
+            if (!slotsRead || slotEntries.empty()) {
                 const std::uintptr_t slotsRoot = ReadPtr(
                     cachedBattleEntities + rr::BattleEntitiesModel::CharacterSlotsRoot);
                 if (slotsRoot > 0x10000) {
@@ -1908,10 +2102,15 @@ static void UpdateInternal()
                 }
             }
 
-            if (slotsRead) {
-                cachedSlots.reserve(slotEntries.size());
-                for (const auto& entry : slotEntries)
-                    cachedSlots[entry.key] = entry.value;
+            if (slotsRead && !slotEntries.empty()) {
+                std::unordered_map<std::int32_t, std::uintptr_t> fresh;
+                fresh.reserve(slotEntries.size());
+                for (const auto& entry : slotEntries) {
+                    if (entry.key >= 0 && entry.value > 0x10000)
+                        fresh[entry.key] = entry.value;
+                }
+                if (!fresh.empty())
+                    cachedSlots.swap(fresh);
             }
         }
     }
@@ -1940,10 +2139,15 @@ static void UpdateInternal()
         RefreshParty(cachedGame, localEntityId, localPublicId);
     }
 
+    if (uiCount <= 3) DLOG("UpdateInternal #%d: pre-entity, battleModel=0x%llx, battleEntities=0x%llx",
+        uiCount, (unsigned long long)cachedBattleModel, (unsigned long long)cachedBattleEntities);
+
     const std::uintptr_t entityDictionary = ReadPtr(
         cachedBattleEntities + rr::BattleEntitiesModel::EntityDict);
     std::vector<RobRunMemory::DictEntry> entityEntries;
+    static int entityDictFailures = 0;
     if (RobRunMemory::ReadDictInt(entityDictionary, entityEntries)) {
+        entityDictFailures = 0;
         entities.reserve(entityEntries.size());
 
         struct TransformBlock {
@@ -1975,7 +2179,9 @@ static void UpdateInternal()
             std::int32_t key = 0;
             std::uintptr_t entityModel = 0;
             std::uintptr_t clientModel = 0;
+            std::uintptr_t serverModel = 0;
             std::uintptr_t simulatedModel = 0;
+            std::uintptr_t slotsModel = 0;
         };
         std::vector<PreResolve> pre;
         pre.reserve(entityEntries.size());
@@ -1987,7 +2193,7 @@ static void UpdateInternal()
 
         for (const auto& entry : entityEntries) {
             if (entry.value <= 0x10000) continue;
-            PreResolve p{ entry.key, entry.value, 0, 0 };
+            PreResolve p{ entry.key, entry.value, 0, 0, 0, 0 };
             if (!forceFullResolve) {
                 const auto cd = detailCache.find(entry.key);
                 if (cd != detailCache.end() && cd->second.characterModel > 0x10000)
@@ -2005,8 +2211,14 @@ static void UpdateInternal()
             if (sc) {
                 for (auto idx : needResolve) {
                     TargetProcess.AddScatterReadRequest(sc,
+                        pre[idx].entityModel + rr::BattleCharacterEntityModel::Slots,
+                        &pre[idx].slotsModel, sizeof(std::uintptr_t));
+                    TargetProcess.AddScatterReadRequest(sc,
                         pre[idx].entityModel + rr::BattleCharacterEntityModel::ClientModel,
                         &pre[idx].clientModel, sizeof(std::uintptr_t));
+                    TargetProcess.AddScatterReadRequest(sc,
+                        pre[idx].entityModel + rr::BattleCharacterEntityModel::ServerModel,
+                        &pre[idx].serverModel, sizeof(std::uintptr_t));
                     TargetProcess.AddScatterReadRequest(sc,
                         pre[idx].entityModel + rr::BattleCharacterEntityModel::SimulatedModel,
                         &pre[idx].simulatedModel, sizeof(std::uintptr_t));
@@ -2018,21 +2230,34 @@ static void UpdateInternal()
 
         for (auto idx : needResolve) {
             auto& p = pre[idx];
-            std::uintptr_t characterModel = p.clientModel;
-            if (characterModel <= 0x10000) characterModel = 0;
+            std::uintptr_t characterModel = 0;
 
-            if (characterModel > 0x10000 &&
-                !IsClass(characterModel, "BattleCharacterModel"))
-            {
-                if (p.simulatedModel > 0x10000 &&
-                    IsClass(p.simulatedModel, "BattleCharacterModel"))
-                    characterModel = p.simulatedModel;
-                else if (IsClass(p.entityModel, "BattleCharacterModel"))
-                    characterModel = p.entityModel;
-                else
-                    characterModel = 0;
-            }
+            // Priority 1: ServerModel (+0x28) is the true BattleCharacterModel with RobberInventoryCost, PrivateModel, Data
+            if (p.serverModel > 0x10000 && IsClass(p.serverModel, "BattleCharacterModel"))
+                characterModel = p.serverModel;
+            // Priority 2: SimulatedModel (+0x30)
+            else if (p.simulatedModel > 0x10000 && IsClass(p.simulatedModel, "BattleCharacterModel"))
+                characterModel = p.simulatedModel;
+            // Priority 3: ClientModel (+0x20)
+            else if (p.clientModel > 0x10000 && (IsClass(p.clientModel, "BattleCharacterModel") || IsClass(p.clientModel, "BattleCharacterClientModel")))
+                characterModel = p.clientModel;
+            // Priority 4: Direct entityModel
+            else if (p.entityModel > 0x10000 && IsClass(p.entityModel, "BattleCharacterModel"))
+                characterModel = p.entityModel;
+
             p.clientModel = characterModel;
+
+            // Populate cachedSlots directly from this entity's _slots if cachedSlots is still empty
+            if (p.slotsModel > 0x10000 && cachedSlots.empty()) {
+                const std::uintptr_t slotDict = ReadPtr(p.slotsModel + rr::CharacterSlotsModel::SlotDict);
+                std::vector<RobRunMemory::DictEntry> directEntries;
+                if (slotDict > 0x10000 && RobRunMemory::ReadDictInt(slotDict, directEntries)) {
+                    for (const auto& se : directEntries) {
+                        if (se.key >= 0 && se.value > 0x10000)
+                            cachedSlots[se.key] = se.value;
+                    }
+                }
+            }
         }
 
         // ---------------------------------------------------------------
@@ -2156,6 +2381,8 @@ static void UpdateInternal()
             w.positionValid = RobRunMemory::Finite(w.block.position);
         }
 
+        if (uiCount <= 3) DLOG("UpdateInternal #%d: phase2 done, %zu work items", uiCount, work.size());
+
         // ---------------------------------------------------------------
         // Phase 3: Rig layout rebuilds and late pose collection.
         // Layouts already valid had their pose read above; newly
@@ -2186,10 +2413,10 @@ static void UpdateInternal()
                 rig.animatorActive = true;
             }
 
-            // Cheap liveness check every 1.5 s: three pointer reads instead of
-            // a full rebuild. Only a failed check forces the expensive path,
-            // so a healthy rig keeps the exact same bone indices (and the
-            // smoothed pose that goes with them) for as long as it exists.
+            // Skeleton layout rebuild is wrapped in try/catch because the
+            // DMA reads through the entity view hierarchy can trigger AVs
+            // on some hardware setups. With /EHa this catch handles SEH.
+            try {
             if (rig.layoutValid && now - rig.layoutStamp >= 1500) {
                 rig.layoutStamp = now;
                 if (viewPtr <= 0x10000 ||
@@ -2211,8 +2438,6 @@ static void UpdateInternal()
                     rig.layoutValid = true;
                     rig.poseFailures = 0;
                     rig.poseFailureSince = 0;
-                    // New indices mean the old smoothed segments describe a
-                    // different bone set; restart from the fresh sample.
                     rig.smoothedValid = false;
                 } else {
                     if (rig.poseFailureSince == 0)
@@ -2224,6 +2449,7 @@ static void UpdateInternal()
                     }
                 }
             }
+            } catch (...) {}
 
             if (rig.layoutValid && !w.needsPose) {
                 const std::size_t sz = Skeleton::PoseDataSize(rig.layout);
@@ -2264,10 +2490,12 @@ static void UpdateInternal()
             std::lock_guard<std::mutex> lock(g_freshCameraMutex);
             if (g_freshCamera.valid) visCamera = g_freshCamera;
         }
-        int detailBudget = 3;
+        if (uiCount <= 3) DLOG("UpdateInternal #%d: entering entity detail loop", uiCount);
+        int detailBudget = 8;
         const std::int64_t battleNowMs = ReadBattleNowMs(cachedBattleEntities);
         for (auto& w : work) {
             if (!w.positionValid) continue;
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: entity id=%d, cp=A (init)", uiCount, w.entityId);
 
             EntityData entity{};
             entity.entityId = w.entityId;
@@ -2283,6 +2511,7 @@ static void UpdateInternal()
                     std::cos(w.block.yaw) * cosPitch);
             }
 
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B (detail cache)", uiCount);
             auto& detail = detailCache[entity.entityId];
             const bool detailModelChanged =
                 detail.characterModel != w.characterModel;
@@ -2291,9 +2520,11 @@ static void UpdateInternal()
                 (detailExpired && detailBudget > 0))
             {
                 if (!detailModelChanged) --detailBudget;
-                detail = DetailCacheEntry{};
-                detail.characterModel = w.characterModel;
-                detail.transform = w.transform;
+                if (detailModelChanged) {
+                    detail = DetailCacheEntry{};
+                    detail.characterModel = w.characterModel;
+                    detail.transform = w.transform;
+                }
                 detail.stamp = now;
 
                 EntityData scratch{};
@@ -2305,6 +2536,7 @@ static void UpdateInternal()
                 if (Il2Cpp::ReadPrimitiveBool(deadWrapper, dead))
                     detail.isDead = dead;
 
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B1 (isDead done)", uiCount);
                 ReadHealth(w.characterModel, scratch);
                 detail.health = scratch.health;
                 detail.maxHealth = scratch.maxHealth;
@@ -2313,9 +2545,11 @@ static void UpdateInternal()
                 detail.armor = scratch.armor;
                 detail.stamina = scratch.stamina;
 
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B2 (health done)", uiCount);
                 scratch.isDead = detail.isDead;
                 ReadRoleAndVehicle(w.characterModel, scratch);
                 ReadCommonState(w.characterModel, scratch);
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B3 (role+common done)", uiCount);
                 ReadReloadAndKnockdownState(w.characterModel, battleNowMs, scratch);
                 detail.isReloading = scratch.isReloading;
                 detail.isKnockedDown = scratch.isKnockedDown;
@@ -2328,19 +2562,23 @@ static void UpdateInternal()
                 detail.isCrouching = scratch.isCrouching;
                 detail.hasArmor = scratch.hasArmor;
                 detail.isFiring = scratch.isFiring;
-                detail.role = scratch.role;
-                detail.roleName = std::move(scratch.roleName);
+                if (scratch.role != 0) detail.role = scratch.role;
+                if (!scratch.roleName.empty()) detail.roleName = std::move(scratch.roleName);
                 detail.inVehicle = scratch.inVehicle;
                 detail.vehicleId = scratch.vehicleId;
 
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B4 (reload+knockdown done)", uiCount);
                 ReadWeaponName(w.characterModel, detail.weaponName, detail.weaponIndex);
 
-                const auto slotIt = slots.find(w.entityId);
-                if (slotIt != slots.end()) {
-                    ReadSlotIdentity(slotIt->second, scratch);
-                    detail.nickname = std::move(scratch.nickname);
-                    detail.clanTag = std::move(scratch.clanTag);
-                    detail.publicId = scratch.publicId;
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B5 (weapon done)", uiCount);
+                if (detail.publicId == 0 || detail.nickname.empty()) {
+                    const auto slotIt = slots.find(w.entityId);
+                    if (slotIt != slots.end()) {
+                        ReadSlotIdentity(slotIt->second, scratch);
+                        detail.nickname = std::move(scratch.nickname);
+                        detail.clanTag = std::move(scratch.clanTag);
+                        detail.publicId = scratch.publicId;
+                    }
                 }
 
                 const std::uintptr_t costModel = ReadPtr(
@@ -2394,21 +2632,39 @@ static void UpdateInternal()
             entity.isHandcuffed = detail.isHandcuffed;
             entity.reloadPhase = detail.reloadPhase;
 
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=C (detail done)", uiCount);
+
             const auto viewIt = views.find(w.entityId);
             if (viewIt != views.end())
                 entity.viewPtr = viewIt->second;
 
             auto& rig = rigCache[w.entityId];
 
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=D (rig, needsPose=%d, layoutValid=%d)", uiCount, (int)w.needsPose, (int)rig.layoutValid);
+
+            try {
             if (w.needsPose) {
+                static bool loggedPose = false;
                 rig.curLocal.resize(static_cast<std::size_t>(rig.layout.count));
+                rig.worldMatrices.resize(static_cast<std::size_t>(rig.layout.count));
+                if (!loggedPose) {
+                    DLOG("RobRunReader: needsPose, layout.count=%d, poseOffset=%zu, poseSize=%zu",
+                        rig.layout.count, (size_t)w.poseOffset, (size_t)w.poseSize);
+                }
                 bool sampled = Skeleton::ProcessPoseData(rig.layout,
                     poseBuf.data() + w.poseOffset, w.poseSize,
-                    rig.bones, &rig.points, rig.curLocal.data());
+                    rig.bones, &rig.points, rig.curLocal.data(),
+                    rig.worldMatrices.data());
 
                 if (!sampled) {
                     sampled = Skeleton::SampleLayout(rig.layout, DmaReadFresh,
-                        rig.bones, &rig.points, rig.curLocal.data());
+                        rig.bones, &rig.points, rig.curLocal.data(),
+                        rig.worldMatrices.data());
+                }
+                if (!loggedPose) {
+                    DLOG("RobRunReader: pose sampled=%d, worldMatrices.size=%zu",
+                        sampled, rig.worldMatrices.size());
+                    loggedPose = true;
                 }
 
                 if (!sampled) {
@@ -2545,11 +2801,13 @@ static void UpdateInternal()
                 }
             } else if (!rig.layoutValid && now - rig.fallbackStamp > 1000) {
                 rig.fallbackStamp = now;
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=D2 (pre-BuildSkeleton)", uiCount);
                 // Never replace good bones with an empty result: this fallback
                 // runs on a timer, so a single failed read used to blank the
                 // skeleton for a full second (a visible strobe).
                 auto fallback = Skeleton::BuildSkeleton(cachedGame, cachedBattleModel,
                     entity.entityId, DmaRead);
+                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=D3 (post-BuildSkeleton, %zu bones)", uiCount, fallback.size());
                 if (!fallback.empty()) {
                     rig.bones = std::move(fallback);
                     rig.points = Skeleton::BonePoints{};
@@ -2563,6 +2821,21 @@ static void UpdateInternal()
             } else {
                 entity.bones = rig.bones;
                 entity.bonePoints = rig.points;
+            }
+            } catch (...) {
+                static int catchCount = 0;
+                if (catchCount++ < 10) DLOG("UpdateInternal: skeleton catch(...) fired for entity %d", entity.entityId);
+            }
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=E (bones done)", uiCount);
+            if (!rig.worldMatrices.empty() &&
+                rig.worldMatrices.size() == static_cast<std::size_t>(rig.layout.count)) {
+                entity.boneWorldMatrices = rig.worldMatrices;
+                entity.boneCount = rig.layout.count;
+                static bool loggedCopy = false;
+                if (!loggedCopy) {
+                    DLOG("RobRunReader: copied %zu worldMatrices to entity", rig.worldMatrices.size());
+                    loggedCopy = true;
+                }
             }
             entity.visible = rig.animatorActive;
 
@@ -2621,7 +2894,15 @@ static void UpdateInternal()
                 }
             }
 
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=F (pre-push)", uiCount);
             entities.push_back(std::move(entity));
+            if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=G (entity done)", uiCount);
+        }
+        if (uiCount <= 3) DLOG("UpdateInternal #%d: entity loop done, %zu entities", uiCount, entities.size());
+    } else {
+        if (++entityDictFailures >= 50) {
+            cachedBattleEntities = 0;
+            entityDictFailures = 0;
         }
     }
 
@@ -2650,13 +2931,24 @@ static void UpdateInternal()
 
 void Update()
 {
-    if (!g_bvhScene.valid || ConfigInstance.Player.BvhPath != g_bvhLoadedPath)
-    {
-        TryLoadBvh(false);
-    }
+    static int updateCount = 0;
+    ++updateCount;
+    if (updateCount <= 3 || (updateCount % 500) == 0)
+        DLOG("Update #%d", updateCount);
 
-    UpdateInternal();
-    PublishSnapshot();
+    try {
+        if (!g_bvhScene.valid || ConfigInstance.Player.BvhPath != g_bvhLoadedPath)
+        {
+            TryLoadBvh(false);
+        }
+
+        UpdateInternal();
+        PublishSnapshot();
+    } catch (const std::exception& e) {
+        DLOG("Update EXCEPTION #%d: %s", updateCount, e.what());
+    } catch (...) {
+        DLOG("Update SEH/UNKNOWN EXCEPTION #%d (AV caught by /EHa)", updateCount);
+    }
 }
 
 SnapshotPtr GetSnapshot()
@@ -2711,6 +3003,12 @@ std::uint32_t GetFailureCount()
 {
     const auto snapshot = GetSnapshot();
     return snapshot ? snapshot->failureCount : 0;
+}
+
+std::string GetLocationId()
+{
+    std::lock_guard<std::mutex> lk(locationMutex);
+    return cachedLocationId;
 }
 
 void SetReadCatalogEnabled(bool enabled) { readCatalog.store(enabled); }
@@ -2794,10 +3092,23 @@ bool GetViewProjection(Matrix4x4& out, int screenWidth, int screenHeight)
             const float aspect =
                 static_cast<float>(screenWidth) / static_cast<float>(screenHeight);
             const float yScale = projection.matrix[1][1];
-            if (std::isfinite(yScale) && yScale > 0.f && aspect > 0.f)
+            if (std::isfinite(yScale) && yScale > 0.01f && aspect > 0.01f)
                 projection.matrix[0][0] = yScale / aspect;
-            out = g_nativeView * projection;
-            return true;
+            Matrix4x4 combined = g_nativeView * projection;
+            bool valid = true;
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    if (!std::isfinite(combined.matrix[r][c])) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) break;
+            }
+            if (valid && (std::abs(combined.matrix[2][3]) > 0.001f || std::abs(combined.matrix[3][2]) > 0.001f)) {
+                out = combined;
+                return true;
+            }
         }
     }
 
@@ -2821,6 +3132,11 @@ bool GetFallbackViewProjection(Matrix4x4& out)
 {
     const auto snapshot = GetSnapshot();
     if (!snapshot || !snapshot->fallbackViewProjectionValid) return false;
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!std::isfinite(snapshot->fallbackViewProjection.matrix[r][c])) return false;
+        }
+    }
     out = snapshot->fallbackViewProjection;
     return true;
 }
@@ -2885,6 +3201,8 @@ Vector2 WorldToScreen(const Matrix4x4& viewProjection, const Vector3& world,
 bool ProjectWorld(const Matrix4x4& viewProjection, const Vector3& world,
     int screenWidth, int screenHeight, Vector2& out)
 {
+    if (screenWidth <= 0 || screenHeight <= 0) return false;
+    if (!RobRunMemory::Finite(world)) return false;
     return RobRunCamera::WorldToScreen(viewProjection, world, screenWidth, screenHeight, out);
 }
 

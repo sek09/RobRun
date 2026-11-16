@@ -119,6 +119,7 @@
       <PreprocessorDefinitions Condition="'$(VeoxPlainStrings)'=='true'">VEOX_PLAIN_STRINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>Create</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <AdditionalIncludeDirectories>$(SolutionDir)$(ProjectName)\Config;$(SolutionDir)$(ProjectName)\Esp;$(SolutionDir)$(ProjectName)\Security;$(SolutionDir)$(ProjectName)\SDK;$(SolutionDir)$(ProjectName)\Misc\Pch;$(SolutionDir)$(ProjectName)\Memory;$(SolutionDir)$(ProjectName)\;$(SolutionDir)$(ProjectName)\Misc;$(SolutionDir)$(ProjectName)\Input;$(SolutionDir)$(ProjectName)\ImGUI;$(SolutionDir)$(ProjectName)\UI;$(SolutionDir)$(ProjectName)\Overlay;$(SolutionDir)Include</AdditionalIncludeDirectories>
@@ -138,9 +139,11 @@
       <PreprocessorDefinitions Condition="'$(VeoxPlainStrings)'=='true'">VEOX_PLAIN_STRINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>Create</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <AdditionalIncludeDirectories>$(SolutionDir)$(ProjectName)\Config;$(SolutionDir)$(ProjectName)\Esp;$(SolutionDir)$(ProjectName)\Security;$(SolutionDir)$(ProjectName)\SDK;$(SolutionDir)$(ProjectName)\Misc\Pch;$(SolutionDir)$(ProjectName)\Memory;$(SolutionDir)$(ProjectName)\;$(SolutionDir)$(ProjectName)\Misc;$(SolutionDir)$(ProjectName)\Input;$(SolutionDir)$(ProjectName)\ImGUI;$(SolutionDir)$(ProjectName)\UI;$(SolutionDir)$(ProjectName)\Overlay;$(SolutionDir)Include</AdditionalIncludeDirectories>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -165,7 +168,9 @@
     <ClCompile Include="Misc\Vector.cpp" />
     <ClCompile Include="SDK\CameraFinder.cpp" />
     <ClCompile Include="SDK\SkeletonExtractor.cpp" />
-    <ClCompile Include="SDK\RobRunReader.cpp" />
+    <ClCompile Include="SDK\RobRunReader.cpp">
+      <ExceptionHandling>Async</ExceptionHandling>
+    </ClCompile>
     <ClCompile Include="SDK\Il2Cpp.cpp" />
     <ClCompile Include="SDK\RobRunMemory.cpp" />
     <ClCompile Include="SDK\RobRunCamera.cpp" />

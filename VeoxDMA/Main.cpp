@@ -8,6 +8,7 @@
 #include "PlayerEsp.h"
 #include "WorldEsp.h"
 #include "Esp/Radar.h"
+#include "DebugLog.h"
 #include "Esp/WeaponSprites.h"
 #include "Aim/AimController.h"
 #include "Input/InputManager.h"
@@ -21,6 +22,7 @@
 static std::atomic<bool> g_attached{ false };
 static std::atomic<bool> g_stopAttach{ false };
 static std::atomic<bool> g_pendingAttachToast{ false };
+static std::atomic<bool> g_pendingReattach{ false };
 static std::thread g_attachThread;
 static HINSTANCE g_hInstance = nullptr;
 
@@ -88,8 +90,23 @@ static void StopAttachLoop()
 	if (g_attachThread.joinable()) g_attachThread.join();
 }
 
+void RequestReattach()
+{
+	g_pendingReattach.store(true);
+}
+
 static void TickOverlay()
 {
+	if (g_pendingReattach.exchange(false))
+	{
+		Overlay::Notify("Re-attaching...", 0xFFFFCC44u, 2.f);
+		RobRunReader::Shutdown();
+		StopAttachLoop();
+		g_attached.store(false, std::memory_order_release);
+		SetAttachStatus("Re-attaching...");
+		StartAttachLoop();
+	}
+
 	const ImVec2 display = ImGui::GetIO().DisplaySize;
 	Aim::SetDisplaySize(display.x, display.y);
 	RobRunReader::RefreshCamera();
@@ -134,32 +151,48 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 	freopen_s(&fDummy, "CONOUT$", "w", stderr);
 	freopen_s(&fDummy, "CONOUT$", "w", stdout);
 	printf("VeoxDMA - Starting...\n");
+	DLOG("=== WinMain entry ===");
 
 	StartAttachLoop();
+	DLOG("AttachLoop started");
 
 	// Apply saved settings before the menu is first drawn.
 	ConfigFile::Load();
+	DLOG("Config loaded");
 
 	Overlay::Callbacks callbacks;
 	callbacks.init = [] {
+		DLOG("Overlay init callback");
 		VeoxMenu::Init();
 		Radar::Init();
 		WeaponSprites::Init();
 		Aim::StartAimWorker();
+		DLOG("Overlay init callback done");
 	};
 	callbacks.tick = [] {
 		TickOverlay();
 	};
 	callbacks.draw = [] {
-		DrawPlayers();
-		if (!ConfigInstance.Overlay.BattleMode) {
-			DrawWorldEntities();
-			Radar::Draw();
+		static int frameCount = 0;
+		++frameCount;
+		if (frameCount <= 3 || (frameCount % 500) == 0)
+			DLOG("Draw frame #%d", frameCount);
+		try {
+			DrawPlayers();
+			if (!ConfigInstance.Overlay.BattleMode) {
+				DrawWorldEntities();
+				Radar::Draw();
+				Radar::DrawFullMap();
+			}
+			Aim::Draw();
+			Aim::DrawDebug();
+			if (Overlay::MenuOpen())
+				VeoxMenu::Draw(g_attached.load(std::memory_order_acquire), GetAttachStatus());
+		} catch (const std::exception& e) {
+			DLOG("Draw EXCEPTION frame #%d: %s", frameCount, e.what());
+		} catch (...) {
+			DLOG("Draw UNKNOWN EXCEPTION frame #%d", frameCount);
 		}
-		Aim::Draw();
-		Aim::DrawDebug();
-		if (Overlay::MenuOpen())
-			VeoxMenu::Draw(g_attached.load(std::memory_order_acquire), GetAttachStatus());
 	};
 	callbacks.shutdown = [] {
 		Aim::StopAimWorker();

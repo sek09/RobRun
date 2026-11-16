@@ -23,6 +23,18 @@ static std::unordered_map<std::string, std::uintptr_t> g_classCache;
 static std::mutex g_primitiveMutex;
 static std::unordered_map<std::uintptr_t, std::uintptr_t> g_primitiveOffsets;
 
+// Cached class names and namespaces keyed by Il2CppClass*.
+// Once an Il2CppClass is initialized, its name and namespace strings are static
+// and immutable in module memory, avoiding repetitive DMA round trips.
+static std::mutex g_classNameCacheMutex;
+static std::unordered_map<std::uintptr_t, std::string> g_classNameCache;
+static std::mutex g_namespaceCacheMutex;
+static std::unordered_map<std::uintptr_t, std::string> g_namespaceCache;
+
+// Cached fields, keyed by (klass ^ (includeParents ? 1 : 0)).
+static std::mutex g_fieldsCacheMutex;
+static std::unordered_map<std::uint64_t, std::vector<Field>> g_fieldsCache;
+
 // Loaded-class-table slot. Resolved once per session: the hardcoded RVA is
 // preferred while it validates, otherwise the AOB scanner recovers it from the
 // GetClassByIndex accessor. Guarded because resolution may run from the reader
@@ -221,6 +233,12 @@ void Init(std::uintptr_t gameAssemblyBase)
     gaBase = gameAssemblyBase;
     std::lock_guard<std::mutex> lock(g_classCacheMutex);
     g_classCache.clear();
+    std::lock_guard<std::mutex> nameLock(g_classNameCacheMutex);
+    g_classNameCache.clear();
+    std::lock_guard<std::mutex> nsLock(g_namespaceCacheMutex);
+    g_namespaceCache.clear();
+    std::lock_guard<std::mutex> fieldsLock(g_fieldsCacheMutex);
+    g_fieldsCache.clear();
     std::lock_guard<std::mutex> primitiveLock(g_primitiveMutex);
     g_primitiveOffsets.clear();
     std::lock_guard<std::mutex> tableLock(g_classTableMutex);
@@ -306,13 +324,33 @@ ClassInfo GetClassInfo(std::uintptr_t klass)
 std::string ClassNameOfClass(std::uintptr_t klass)
 {
     if (!ValidPtr(klass)) return {};
-    return ReadCString(ReadPtr(klass + rr::Klass::name_ptr));
+    {
+        std::lock_guard<std::mutex> lock(g_classNameCacheMutex);
+        const auto it = g_classNameCache.find(klass);
+        if (it != g_classNameCache.end()) return it->second;
+    }
+    std::string name = ReadCString(ReadPtr(klass + rr::Klass::name_ptr));
+    if (!name.empty()) {
+        std::lock_guard<std::mutex> lock(g_classNameCacheMutex);
+        g_classNameCache[klass] = name;
+    }
+    return name;
 }
 
 std::string NamespaceOfClass(std::uintptr_t klass)
 {
     if (!ValidPtr(klass)) return {};
-    return ReadCString(ReadPtr(klass + rr::Klass::namespace_ptr));
+    {
+        std::lock_guard<std::mutex> lock(g_namespaceCacheMutex);
+        const auto it = g_namespaceCache.find(klass);
+        if (it != g_namespaceCache.end()) return it->second;
+    }
+    std::string ns = ReadCString(ReadPtr(klass + rr::Klass::namespace_ptr));
+    if (!ns.empty()) {
+        std::lock_guard<std::mutex> lock(g_namespaceCacheMutex);
+        g_namespaceCache[klass] = ns;
+    }
+    return ns;
 }
 
 std::uintptr_t ClassOf(std::uintptr_t object)
@@ -357,6 +395,14 @@ std::uintptr_t GetStaticFieldsForClass(std::uintptr_t klass)
 
 std::vector<Field> Fields(std::uintptr_t klass, bool includeParents)
 {
+    if (!ValidPtr(klass)) return {};
+    const std::uint64_t cacheKey = static_cast<std::uint64_t>(klass) ^ (includeParents ? 0x1ULL : 0x0ULL);
+    {
+        std::lock_guard<std::mutex> lock(g_fieldsCacheMutex);
+        const auto it = g_fieldsCache.find(cacheKey);
+        if (it != g_fieldsCache.end()) return it->second;
+    }
+
     std::vector<Field> out;
     for (int depth = 0; ValidPtr(klass) && depth < 32; ++depth) {
         const std::uintptr_t fields = ReadPtr(klass + rr::Klass::fields);
@@ -385,6 +431,11 @@ std::vector<Field> Fields(std::uintptr_t klass, bool includeParents)
         }
         if (!includeParents) break;
         klass = ReadPtr(klass + rr::Klass::parent);
+    }
+
+    if (!out.empty()) {
+        std::lock_guard<std::mutex> lock(g_fieldsCacheMutex);
+        g_fieldsCache[cacheKey] = out;
     }
     return out;
 }

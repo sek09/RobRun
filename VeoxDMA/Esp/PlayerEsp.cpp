@@ -5,11 +5,16 @@
 #include "RobRunMemory.h"
 #include "EspDraw.h"
 #include "WeaponSprites.h"
+#include "CharacterMesh.h"
+#include "DebugLog.h"
 #include "../ImGUI/imgui.h"
 #include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <unordered_map>
+
+static CharacterMesh::Mesh g_charMesh;
+static bool g_charMeshLoadAttempted = false;
 
 static ImVec2 MeasureText(const char* text, float size)
 {
@@ -154,6 +159,47 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 	const float outlineThick = 1.0f;
 	const float scale = std::clamp(pcfg.ChamsScale, 0.4f, 2.5f);
 
+	// Mesh-based chams: skin the character mesh and draw filled triangles
+	if (!g_charMeshLoadAttempted) {
+		g_charMeshLoadAttempted = true;
+		DLOG("PlayerEsp: attempting CharacterMesh::Load");
+		try {
+			bool loadOk = CharacterMesh::Load("character_mesh.bin", g_charMesh);
+			DLOG("PlayerEsp: CharacterMesh::Load returned %d, valid=%d, bones=%u, verts=%zu, tris=%zu",
+				loadOk, g_charMesh.valid, g_charMesh.numBones,
+				g_charMesh.vertices.size(), g_charMesh.indices.size() / 3);
+		} catch (const std::exception& e) {
+			DLOG("PlayerEsp: CharacterMesh::Load EXCEPTION: %s", e.what());
+			g_charMesh.valid = false;
+		} catch (...) {
+			DLOG("PlayerEsp: CharacterMesh::Load UNKNOWN EXCEPTION");
+			g_charMesh.valid = false;
+		}
+	}
+	if (g_charMesh.valid && ent.boneWorldMatrices.size() >= 2) {
+		static std::vector<int> boneMap;
+		static std::vector<Vector3> skinned;
+		static bool loggedOnce = false;
+		if (!loggedOnce) {
+			DLOG("PlayerEsp: mesh chams path entered, boneWorldMatrices.size=%zu", ent.boneWorldMatrices.size());
+			loggedOnce = true;
+		}
+		if (boneMap.size() != g_charMesh.numBones) {
+			boneMap.resize(g_charMesh.numBones);
+			for (std::uint32_t i = 0; i < g_charMesh.numBones; ++i)
+				boneMap[i] = static_cast<int>(i);
+		}
+		skinned.resize(g_charMesh.vertices.size());
+
+		const int safeBoneCount = static_cast<int>(ent.boneWorldMatrices.size());
+		CharacterMesh::Skin(g_charMesh, ent.boneWorldMatrices.data(),
+			safeBoneCount, boneMap.data(), skinned.data());
+
+		if (CharacterMesh::Draw(dl, g_charMesh, skinned.data(), vp,
+			screenW, screenH, chamsCol))
+			return;
+	}
+
 	const auto& bp = ent.bonePoints;
 
 	const bool haveHead = bp.hasHead && IsValidBone(bp.head, root);
@@ -177,20 +223,46 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 
 	bool drawnAny = false;
 
-	// 1. Torso rendering
-	// When shoulders and hips are available, verify convexity and non-intersection before AddQuadFilled.
-	// If the quad is self-intersecting (bow-tie when character turns/rotates), fall back to clean capsules.
-	bool torsoDrawn = false;
+	// ---- PASS 1: FILL everything (no outlines) ----
+	// Draw all fills first so overlapping capsules create a solid body.
+
+	// 1a. Torso capsules (always drawn — provides fill even when quad is used)
+	if (haveNeck && haveChest)
+	{
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.neck, 0.14f * scale,
+			bp.chest, 0.24f * scale, root, chamsCol, false, 0, 0, false, false);
+		drawnAny = true;
+	}
+	if (haveChest && havePelvis)
+	{
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.chest, 0.24f * scale,
+			bp.pelvis, 0.20f * scale, root, chamsCol, false, 0, 0, false, true);
+		drawnAny = true;
+	}
+	if (haveLS && haveRS)
+	{
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftShoulder, 0.14f * scale,
+			bp.rightShoulder, 0.14f * scale, root, chamsCol, false, 0, 0, false, false);
+		drawnAny = true;
+	}
+	if (haveLHip && haveRHip)
+	{
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftHip, 0.14f * scale,
+			bp.rightHip, 0.14f * scale, root, chamsCol, false, 0, 0, false, false);
+		drawnAny = true;
+	}
+
+	// 1b. Torso quad overlay (extra fill, wider coverage at any angle)
+	bool torsoQuadOk = false;
+	ImVec2 sLS{}, sRS{}, sRHip{}, sLHip{};
 	if (haveLS && haveRS && haveLHip && haveRHip)
 	{
-		ImVec2 sLS{}, sRS{}, sRHip{}, sLHip{};
 		float rLS = 0.f, rRS = 0.f, rRHip = 0.f, rLHip = 0.f;
-		if (ProjectWithRadius(vp, bp.leftShoulder, 0.08f * scale, screenW, screenH, sLS, rLS) &&
-			ProjectWithRadius(vp, bp.rightShoulder, 0.08f * scale, screenW, screenH, sRS, rRS) &&
-			ProjectWithRadius(vp, bp.rightHip, 0.09f * scale, screenW, screenH, sRHip, rRHip) &&
-			ProjectWithRadius(vp, bp.leftHip, 0.09f * scale, screenW, screenH, sLHip, rLHip))
+		if (ProjectWithRadius(vp, bp.leftShoulder, 0.18f * scale, screenW, screenH, sLS, rLS) &&
+			ProjectWithRadius(vp, bp.rightShoulder, 0.18f * scale, screenW, screenH, sRS, rRS) &&
+			ProjectWithRadius(vp, bp.rightHip, 0.16f * scale, screenW, screenH, sRHip, rRHip) &&
+			ProjectWithRadius(vp, bp.leftHip, 0.16f * scale, screenW, screenH, sLHip, rLHip))
 		{
-			// Check cross products of consecutive edges to ensure quad is convex and non-self-intersecting
 			const ImVec2 pts[4] = { sLS, sRS, sRHip, sLHip };
 			bool isConvex = true;
 			float sign = 0.f;
@@ -203,125 +275,134 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 				if (sign == 0.f) sign = (cp > 0.f) ? 1.f : -1.f;
 				else if ((cp > 0.f && sign < 0.f) || (cp < 0.f && sign > 0.f)) { isConvex = false; break; }
 			}
-
 			if (isConvex) {
 				dl->AddQuadFilled(sLS, sRS, sRHip, sLHip, chamsCol);
-				if (outline && (outlineCol & IM_COL32_A_MASK) != 0) {
-					dl->AddLine(sLS, sRS, outlineCol, outlineThick);
-					dl->AddLine(sRS, sRHip, outlineCol, outlineThick);
-					dl->AddLine(sRHip, sLHip, outlineCol, outlineThick);
-					dl->AddLine(sLHip, sLS, outlineCol, outlineThick);
-				}
-				torsoDrawn = true;
+				torsoQuadOk = true;
 				drawnAny = true;
 			}
 		}
 	}
 
-	if (!torsoDrawn)
-	{
-		// Continuous capsule torso: Neck -> Chest -> Pelvis + shoulder/hip bridges
-		if (haveNeck && haveChest)
-		{
-			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.neck, 0.08f * scale,
-				bp.chest, 0.15f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
-			drawnAny = true;
-		}
-		if (haveChest && havePelvis)
-		{
-			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.chest, 0.15f * scale,
-				bp.pelvis, 0.13f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, true);
-			drawnAny = true;
-		}
-		if (haveLS && haveRS)
-		{
-			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftShoulder, 0.08f * scale,
-				bp.rightShoulder, 0.08f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
-			drawnAny = true;
-		}
-		if (haveLHip && haveRHip)
-		{
-			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftHip, 0.09f * scale,
-				bp.rightHip, 0.09f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
-			drawnAny = true;
-		}
-	}
-
-	// 2. Head & Neck
+	// 2a. Head fill
 	if (haveHead)
 	{
-		DrawSpherePoint(dl, vp, screenW, screenH, bp.head, 0.115f * scale, root,
-			chamsCol, outline, outlineCol, outlineThick);
+		DrawSpherePoint(dl, vp, screenW, screenH, bp.head, 0.14f * scale, root,
+			chamsCol, false, 0, 0);
 		drawnAny = true;
 	}
 	if (haveHead && haveNeck)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.head, 0.085f * scale,
-			bp.neck, 0.075f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.head, 0.12f * scale,
+			bp.neck, 0.12f * scale, root, chamsCol, false, 0, 0, false, false);
 		drawnAny = true;
 	}
 	else if (haveHead && haveChest)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.head, 0.085f * scale,
-			bp.chest, 0.09f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.head, 0.12f * scale,
+			bp.chest, 0.16f * scale, root, chamsCol, false, 0, 0, false, false);
 		drawnAny = true;
 	}
 
-	// 3. Arms (connecting at elbow without interior circular seam)
+	// 3a. Arm fills
 	if (haveLS && haveLE)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftShoulder, 0.08f * scale,
-			bp.leftElbow, 0.07f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftShoulder, 0.12f * scale,
+			bp.leftElbow, 0.10f * scale, root, chamsCol, false, 0, 0, true, false);
 		drawnAny = true;
 	}
 	if (haveLE && haveLH)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftElbow, 0.07f * scale,
-			bp.leftHand, 0.06f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, true);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftElbow, 0.10f * scale,
+			bp.leftHand, 0.08f * scale, root, chamsCol, false, 0, 0, false, true);
 		drawnAny = true;
 	}
-
 	if (haveRS && haveRE)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightShoulder, 0.08f * scale,
-			bp.rightElbow, 0.07f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightShoulder, 0.12f * scale,
+			bp.rightElbow, 0.10f * scale, root, chamsCol, false, 0, 0, true, false);
 		drawnAny = true;
 	}
 	if (haveRE && haveRH)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightElbow, 0.07f * scale,
-			bp.rightHand, 0.06f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, true);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightElbow, 0.10f * scale,
+			bp.rightHand, 0.08f * scale, root, chamsCol, false, 0, 0, false, true);
 		drawnAny = true;
 	}
 
-	// 4. Legs (connecting at knee without interior circular seam)
+	// 4a. Leg fills
 	if (haveLHip && haveLKnee)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftHip, 0.10f * scale,
-			bp.leftKnee, 0.085f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftHip, 0.15f * scale,
+			bp.leftKnee, 0.12f * scale, root, chamsCol, false, 0, 0, true, false);
 		drawnAny = true;
 	}
 	if (haveLKnee && haveLFoot)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftKnee, 0.085f * scale,
-			bp.leftFoot, 0.07f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, true);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftKnee, 0.12f * scale,
+			bp.leftFoot, 0.09f * scale, root, chamsCol, false, 0, 0, false, true);
 		drawnAny = true;
 	}
-
 	if (haveRHip && haveRKnee)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightHip, 0.10f * scale,
-			bp.rightKnee, 0.085f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, false);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightHip, 0.15f * scale,
+			bp.rightKnee, 0.12f * scale, root, chamsCol, false, 0, 0, true, false);
 		drawnAny = true;
 	}
 	if (haveRKnee && haveRFoot)
 	{
-		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightKnee, 0.085f * scale,
-			bp.rightFoot, 0.07f * scale, root, chamsCol, outline, outlineCol, outlineThick, false, true);
+		DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightKnee, 0.12f * scale,
+			bp.rightFoot, 0.09f * scale, root, chamsCol, false, 0, 0, false, true);
 		drawnAny = true;
 	}
 
-	// 5. Fallback: if named bone points didn't resolve full body, render validated ent.bones
+	// ---- PASS 2: OUTLINE only (on top of all fills) ----
+	if (outline && (outlineCol & IM_COL32_A_MASK) != 0)
+	{
+		const ImU32 noFill = IM_COL32(0, 0, 0, 0);
+
+		// Torso quad outline
+		if (torsoQuadOk) {
+			dl->AddLine(sLS, sRS, outlineCol, outlineThick);
+			dl->AddLine(sRS, sRHip, outlineCol, outlineThick);
+			dl->AddLine(sRHip, sLHip, outlineCol, outlineThick);
+			dl->AddLine(sLHip, sLS, outlineCol, outlineThick);
+		}
+
+		// Head outline
+		if (haveHead)
+			DrawSpherePoint(dl, vp, screenW, screenH, bp.head, 0.14f * scale, root,
+				noFill, true, outlineCol, outlineThick);
+
+		// Arm outlines (outer contour only — cap at shoulder and hand)
+		if (haveLS && haveLE)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftShoulder, 0.12f * scale,
+				bp.leftElbow, 0.10f * scale, root, noFill, true, outlineCol, outlineThick, true, false);
+		if (haveLE && haveLH)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftElbow, 0.10f * scale,
+				bp.leftHand, 0.08f * scale, root, noFill, true, outlineCol, outlineThick, false, true);
+		if (haveRS && haveRE)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightShoulder, 0.12f * scale,
+				bp.rightElbow, 0.10f * scale, root, noFill, true, outlineCol, outlineThick, true, false);
+		if (haveRE && haveRH)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightElbow, 0.10f * scale,
+				bp.rightHand, 0.08f * scale, root, noFill, true, outlineCol, outlineThick, false, true);
+
+		// Leg outlines (cap at hip and foot)
+		if (haveLHip && haveLKnee)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftHip, 0.15f * scale,
+				bp.leftKnee, 0.12f * scale, root, noFill, true, outlineCol, outlineThick, true, false);
+		if (haveLKnee && haveLFoot)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.leftKnee, 0.12f * scale,
+				bp.leftFoot, 0.09f * scale, root, noFill, true, outlineCol, outlineThick, false, true);
+		if (haveRHip && haveRKnee)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightHip, 0.15f * scale,
+				bp.rightKnee, 0.12f * scale, root, noFill, true, outlineCol, outlineThick, true, false);
+		if (haveRKnee && haveRFoot)
+			DrawCapsuleSegment(dl, vp, screenW, screenH, bp.rightKnee, 0.12f * scale,
+				bp.rightFoot, 0.09f * scale, root, noFill, true, outlineCol, outlineThick, false, true);
+	}
+
+	// 5. Fallback: if named bone points didn't resolve, render validated ent.bones
 	if (!drawnAny)
 	{
 		for (const auto& seg : ent.bones)
@@ -335,8 +416,8 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 					? Esp::ShadeColour(pcfg.ChamsVisibleColour, pcfg.ChamsAlpha)
 					: Esp::ShadeColour(pcfg.ChamsHiddenColour, pcfg.ChamsAlpha);
 			}
-			DrawCapsuleSegment(dl, vp, screenW, screenH, seg.a, 0.075f * scale,
-				seg.b, 0.075f * scale, root, segChamsCol, outline, outlineCol, outlineThick, true, true);
+			DrawCapsuleSegment(dl, vp, screenW, screenH, seg.a, 0.12f * scale,
+				seg.b, 0.12f * scale, root, segChamsCol, outline, outlineCol, outlineThick, true, true);
 		}
 	}
 }
@@ -386,6 +467,13 @@ static void DrawOffscreenArrow(ImDrawList* dl, int screenW, int screenH,
 
 void DrawPlayers()
 {
+	static int drawCount = 0;
+	++drawCount;
+	if (drawCount <= 3 || (drawCount % 500) == 0)
+		DLOG("DrawPlayers #%d", drawCount);
+
+	try {
+
 	const ImVec2 display = ImGui::GetIO().DisplaySize;
 	const int screenW = (int)display.x;
 	const int screenH = (int)display.y;
@@ -502,13 +590,40 @@ void DrawPlayers()
 						? Esp::D2DColorToImU32(pcfg.VisibleColour)
 						: Esp::D2DColorToImU32(pcfg.HiddenColour);
 				}
-				dl->AddLine(a, b, segCol, 2.f);
+				dl->AddLine(a, b, segCol, pcfg.SkeletonThickness);
 			}
 			minX = std::min(minX, std::min(a.x, b.x));
 			maxX = std::max(maxX, std::max(a.x, b.x));
 			minY = std::min(minY, std::min(a.y, b.y));
 			maxY = std::max(maxY, std::max(a.y, b.y));
 			boxValid = true;
+		}
+
+		if (pcfg.HeadCircle && pcfg.Skeleton &&
+			ent.bonePoints.hasHead && ent.bonePoints.hasNeck &&
+			IsValidBone(ent.bonePoints.head, entPos) &&
+			IsValidBone(ent.bonePoints.neck, entPos))
+		{
+			const Vector3& head = ent.bonePoints.head;
+			const Vector3& neck = ent.bonePoints.neck;
+			const float headRadius = Distance(head, neck) * 0.5f;
+			const Vector3 center(
+				(head.x + neck.x) * 0.5f,
+				(head.y + neck.y) * 0.5f,
+				(head.z + neck.z) * 0.5f);
+			ImVec2 sc{}; float sr = 0.f;
+			if (headRadius > 0.02f &&
+				ProjectWithRadius(viewProjection, center, headRadius,
+					screenW, screenH, sc, sr))
+			{
+				ImU32 headCol = espCol;
+				if (pcfg.VisCheck || pcfg.WallCheck) {
+					headCol = ent.visible
+						? Esp::D2DColorToImU32(pcfg.VisibleColour)
+						: Esp::D2DColorToImU32(pcfg.HiddenColour);
+				}
+				dl->AddCircle(sc, sr, headCol, 0, 2.f);
+			}
 		}
 
 		if (!boxValid)
@@ -873,5 +988,11 @@ void DrawPlayers()
 		ImGui::End();
 		ImGui::PopStyleVar(3);
 		ImGui::PopStyleColor(2);
+	}
+
+	} catch (const std::exception& e) {
+		DLOG("DrawPlayers EXCEPTION #%d: %s", drawCount, e.what());
+	} catch (...) {
+		DLOG("DrawPlayers UNKNOWN EXCEPTION #%d", drawCount);
 	}
 }

@@ -6,6 +6,7 @@ namespace Radar {
 
 void Init();
 void Draw();
+void DrawFullMap();
 void Shutdown();
 
 const std::vector<std::string>& GetMapFiles();

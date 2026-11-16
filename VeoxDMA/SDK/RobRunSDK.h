@@ -152,11 +152,16 @@ inline constexpr std::uintptr_t WorldEntitiesModel       = 0x518;
 inline constexpr std::uintptr_t WorldEntitiesModelAlt    = 0x60;
 
 inline constexpr std::uintptr_t CharacterSlotsModel = 0x248;
-inline constexpr std::uintptr_t CharacterSlotsModelLegacy = 0x4C8;
+inline constexpr std::uintptr_t CharacterSlotsModelLegacy = 0x4D0;
 inline constexpr std::uintptr_t ProlongedInteractionDialog = 0x188;
 inline constexpr std::uintptr_t CoinsModel                 = 0x4A8;
 inline constexpr std::uintptr_t CryptoCoinsModel           = 0x4B0;
 inline constexpr std::uintptr_t DelayedUseAction           = 0x610;
+inline constexpr std::uintptr_t BattleSettings             = 0x98;
+}
+
+namespace BattleSettingsDescription {
+inline constexpr std::uintptr_t Id    = 0x10;
 }
 
 namespace PlayerRotationInputModel {
@@ -941,6 +946,19 @@ inline constexpr std::uintptr_t EndTs   = 0x28; // float
 
 namespace AutoLootAfterBreakModel {
 inline constexpr std::uintptr_t AutoLootEndTs = 0x28; // float
+}
+
+namespace InventoryRevealViewDescriptions {
+inline constexpr std::uintptr_t Items    = 0x10; // List<Pair> _items
+inline constexpr std::uintptr_t Size     = 0x18; // int _size
+inline constexpr std::uintptr_t Data     = 0x20; // array base
+inline constexpr std::uintptr_t Stride   = 0x18;
+inline constexpr std::uintptr_t PairDesc = 0x10; // Pair -> Description
+inline constexpr std::uintptr_t ScanTime = 0x58; // Description.TimeToOneCellBorder (f32)
+inline constexpr std::uintptr_t ShineView     = 0x18; // Description -> ShineView
+inline constexpr std::uintptr_t ShineDuration = 0x28; // ShineView.Duration (f32)
+inline constexpr std::uintptr_t IconView      = 0x50; // Description -> IconView
+inline constexpr std::uintptr_t IconDuration  = 0x18; // IconView.Duration (f32)
 }
 
 namespace RadiusInteractEntityModel {

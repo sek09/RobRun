@@ -204,8 +204,10 @@ CameraState Read(std::uintptr_t battleCameraModel)
 bool BuildViewProjection(const CameraState& camera, float aspect,
     Matrix4x4& out, float nearPlane, float farPlane)
 {
-    if (!camera.valid || !std::isfinite(aspect) || aspect <= 0.f) return false;
-    if (!(nearPlane > 0.f) || !(farPlane > nearPlane)) return false;
+    if (!camera.valid || !std::isfinite(aspect) || aspect <= 0.01f || aspect > 100.f) return false;
+    if (!std::isfinite(nearPlane) || !std::isfinite(farPlane) || !(nearPlane > 0.001f) || !(farPlane > nearPlane)) return false;
+    if (!Finite(camera.position) || !Finite(camera.forward) || !Finite(camera.right) || !Finite(camera.up)) return false;
+    if (!std::isfinite(camera.verticalFov) || camera.verticalFov < 1.0f || camera.verticalFov > 179.0f) return false;
 
     const Vector3& p = camera.position;
     const Vector3& r = camera.right;
@@ -227,7 +229,10 @@ bool BuildViewProjection(const CameraState& camera, float aspect,
     view.matrix[3][0] = -dotRP; view.matrix[3][1] = -dotUP; view.matrix[3][2] = dotFP; view.matrix[3][3] = 1.f;
 
     const float fovRadians = camera.verticalFov * 3.14159265358979323846f / 180.f;
-    const float yScale = 1.f / std::tan(fovRadians * 0.5f);
+    const float halfTan = std::tan(fovRadians * 0.5f);
+    if (!std::isfinite(halfTan) || halfTan <= 0.0001f) return false;
+
+    const float yScale = 1.f / halfTan;
     const float xScale = yScale / aspect;
     const float a = (farPlane + nearPlane) / (nearPlane - farPlane);
     const float b = (2.f * farPlane * nearPlane) / (nearPlane - farPlane);
@@ -239,7 +244,14 @@ bool BuildViewProjection(const CameraState& camera, float aspect,
     projection.matrix[2][3] = -1.f;
     projection.matrix[3][2] = b;
 
-    out = view * projection;
+    Matrix4x4 result = view * projection;
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (!std::isfinite(result.matrix[row][col])) return false;
+        }
+    }
+
+    out = result;
     return true;
 }
 
@@ -247,6 +259,7 @@ bool WorldToScreen(const Matrix4x4& viewProjection, const Vector3& world,
     int screenWidth, int screenHeight, Vector2& out)
 {
     if (screenWidth <= 0 || screenHeight <= 0) return false;
+    if (!Finite(world)) return false;
 
     const float clipX = viewProjection.matrix[0][0] * world.x +
         viewProjection.matrix[1][0] * world.y +
@@ -261,8 +274,10 @@ bool WorldToScreen(const Matrix4x4& viewProjection, const Vector3& world,
         viewProjection.matrix[2][3] * world.z +
         viewProjection.matrix[3][3];
 
+    // Gate: reject non-finite and points behind/at the near-clipping plane (< 0.05m)
+    // where perspective divide creates massive coordinate explosions.
     if (!std::isfinite(clipX) || !std::isfinite(clipY) ||
-        !std::isfinite(clipW) || clipW <= 0.001f) {
+        !std::isfinite(clipW) || clipW <= 0.05f) {
         return false;
     }
 
@@ -270,8 +285,22 @@ bool WorldToScreen(const Matrix4x4& viewProjection, const Vector3& world,
     const float ndcY = clipY / clipW;
     if (!std::isfinite(ndcX) || !std::isfinite(ndcY)) return false;
 
-    out.x = (screenWidth * 0.5f) * (1.f + ndcX);
-    out.y = (screenHeight * 0.5f) * (1.f - ndcY);
+    // Reject extreme NDC coordinates far outside the frustum to avoid numerical instability
+    if (std::abs(ndcX) > 35.0f || std::abs(ndcY) > 35.0f) return false;
+
+    const float sx = (screenWidth * 0.5f) * (1.f + ndcX);
+    const float sy = (screenHeight * 0.5f) * (1.f - ndcY);
+    if (!std::isfinite(sx) || !std::isfinite(sy)) return false;
+
+    // Sanity boundary check: protect ImGui / DirectX from overflow
+    constexpr float kMaxCoord = 50000.0f;
+    if (sx < -kMaxCoord || sx > static_cast<float>(screenWidth) + kMaxCoord ||
+        sy < -kMaxCoord || sy > static_cast<float>(screenHeight) + kMaxCoord) {
+        return false;
+    }
+
+    out.x = sx;
+    out.y = sy;
     return true;
 }
 

@@ -2,6 +2,7 @@
 #include "Radar.h"
 #include "ConfigInstance.h"
 #include "RobRunReader.h"
+#include "RobRunMemory.h"
 #include "../Overlay/Overlay.h"
 #include "../ImGUI/imgui.h"
 #include <d3d11.h>
@@ -541,6 +542,264 @@ void Draw()
 
 	ImGui::End();
 	ImGui::PopStyleColor(4);
+	ImGui::PopStyleVar(2);
+}
+
+static const char* MapFileForLocation(const std::string& id)
+{
+	if (id == "shootercity")   return "city_colliders_map.png";
+	if (id == "settlement")    return "settlement.png";
+	if (id == "settlement2")   return "settlement_2.png";
+	if (id == "prison")        return "prison.png";
+	if (id == "hub")           return "hangar.png";
+	if (id == "sectorcenter")  return "city_colliders_map.png";
+	if (id == "clanbattle")    return "city_colliders_map.png";
+	return nullptr;
+}
+
+void DrawFullMap()
+{
+	if (!ConfigInstance.Radar.PopoutWindow) return;
+
+	{
+		static std::string lastLocationId;
+		const std::string loc = RobRunReader::GetLocationId();
+		if (!loc.empty() && loc != lastLocationId) {
+			lastLocationId = loc;
+			std::string lower = loc;
+			for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+			const char* file = MapFileForLocation(lower);
+			if (file) {
+				for (int i = 0; i < (int)g_mapFiles.size(); i++) {
+					if (g_mapFiles[i] == file) {
+						SetMap(i);
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	const auto snapshot = RobRunReader::GetSnapshot();
+	const auto& cfg = ConfigInstance.Radar;
+
+	ImGui::SetNextWindowPos(
+		ImVec2((float)cfg.PopoutX, (float)cfg.PopoutY), ImGuiCond_FirstUseEver);
+	ImGui::SetNextWindowSize(
+		ImVec2((float)cfg.PopoutW, (float)cfg.PopoutH), ImGuiCond_FirstUseEver);
+
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.f, 4.f));
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(10, 12, 18, 240));
+	ImGui::PushStyleColor(ImGuiCol_TitleBg, IM_COL32(16, 18, 28, 240));
+	ImGui::PushStyleColor(ImGuiCol_TitleBgActive, IM_COL32(25, 60, 120, 240));
+
+	if (!ImGui::Begin("Full Map", &ConfigInstance.Radar.PopoutWindow,
+		ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+		ImGuiWindowFlags_NoCollapse))
+	{
+		ImGui::End();
+		ImGui::PopStyleColor(3);
+		ImGui::PopStyleVar(2);
+		return;
+	}
+
+	// Persist window position/size back to config
+	{
+		const ImVec2 wp = ImGui::GetWindowPos();
+		const ImVec2 ws = ImGui::GetWindowSize();
+		ConfigInstance.Radar.PopoutX = (int)wp.x;
+		ConfigInstance.Radar.PopoutY = (int)wp.y;
+		ConfigInstance.Radar.PopoutW = (int)ws.x;
+		ConfigInstance.Radar.PopoutH = (int)ws.y;
+	}
+
+	const ImVec2 contentPos = ImGui::GetCursorScreenPos();
+	const ImVec2 contentSize = ImGui::GetContentRegionAvail();
+	if (contentSize.x < 10.f || contentSize.y < 10.f) {
+		ImGui::End();
+		ImGui::PopStyleColor(3);
+		ImGui::PopStyleVar(2);
+		return;
+	}
+
+	const float worldW = cfg.WorldMaxX - cfg.WorldMinX;
+	const float worldH = cfg.WorldMaxZ - cfg.WorldMinZ;
+	if (worldW <= 0.f || worldH <= 0.f) {
+		ImGui::End();
+		ImGui::PopStyleColor(3);
+		ImGui::PopStyleVar(2);
+		return;
+	}
+
+	// Fill the entire content area; zoom scales from there
+	const float zoom = cfg.Zoom;
+	float drawW = contentSize.x * zoom;
+	float drawH = contentSize.y * zoom;
+
+	// Center of content area — pan offset via scroll
+	static ImVec2 s_pan{0.f, 0.f};
+	const ImVec2 drawOrigin(
+		contentPos.x + (contentSize.x - drawW) * 0.5f + s_pan.x,
+		contentPos.y + (contentSize.y - drawH) * 0.5f + s_pan.y);
+
+	ImDrawList* dl = ImGui::GetWindowDrawList();
+	const ImVec2 clipMin = contentPos;
+	const ImVec2 clipMax(contentPos.x + contentSize.x, contentPos.y + contentSize.y);
+	dl->PushClipRect(clipMin, clipMax, true);
+
+	// Map texture or dark background
+	const ImVec2 mapMin = drawOrigin;
+	const ImVec2 mapMax(drawOrigin.x + drawW, drawOrigin.y + drawH);
+	if (g_mapSRV && cfg.ShowMap) {
+		dl->AddImage((ImTextureID)g_mapSRV, mapMin, mapMax,
+			ImVec2(0.f, 0.f), ImVec2(1.f, 1.f), IM_COL32(255, 255, 255, 200));
+	} else {
+		dl->AddRectFilled(mapMin, mapMax, IM_COL32(18, 22, 32, 220));
+	}
+	dl->AddRect(mapMin, mapMax, IM_COL32(40, 80, 160, 180), 0.f, 0, 1.5f);
+
+	// Helper: world XZ -> screen pixel
+	auto worldToScreen = [&](float wx, float wz) -> ImVec2 {
+		float nx = (wx - cfg.WorldMinX) / worldW;
+		float nz = (wz - cfg.WorldMinZ) / worldH;
+		return ImVec2(drawOrigin.x + nx * drawW, drawOrigin.y + nz * drawH);
+	};
+
+	// Draw world entities
+	if (snapshot && snapshot->world && snapshot->world->valid) {
+		for (const auto& ent : snapshot->world->entities) {
+			if (!ConfigInstance.World.ShowEmpty && ent.hasEmptyFlag && ent.empty) continue;
+
+			ImU32 dotCol = IM_COL32(200, 200, 200, 180);
+			float dotSize = 3.f;
+			bool show = false;
+
+			switch (ent.kind) {
+			case RobRunWorld::Kind::Car:
+			case RobRunWorld::Kind::Helicopter:
+			case RobRunWorld::Kind::Vehicle:
+			case RobRunWorld::Kind::VehicleTrunk:
+				show = cfg.ShowVehicles;
+				dotCol = IM_COL32(120, 190, 255, 220);
+				dotSize = 4.f;
+				break;
+			case RobRunWorld::Kind::DroppedBag:
+				show = cfg.ShowDroppedBags;
+				dotCol = IM_COL32(120, 255, 140, 220);
+				dotSize = 3.5f;
+				break;
+			case RobRunWorld::Kind::CashLootNode:
+			case RobRunWorld::Kind::SettlementCash:
+			case RobRunWorld::Kind::MoneyWorkbench:
+				show = cfg.ShowValuables;
+				dotCol = IM_COL32(255, 215, 0, 230);
+				dotSize = 4.f;
+				break;
+			case RobRunWorld::Kind::SafeDoor:
+				show = cfg.ShowContainers;
+				dotCol = IM_COL32(255, 215, 0, 220);
+				dotSize = 3.5f;
+				break;
+			case RobRunWorld::Kind::Container:
+			case RobRunWorld::Kind::LootNode:
+			case RobRunWorld::Kind::StorageBox:
+			case RobRunWorld::Kind::Shelving:
+			case RobRunWorld::Kind::CollectionTable:
+			case RobRunWorld::Kind::PlotContainer:
+				show = cfg.ShowContainers;
+				dotCol = IM_COL32(255, 190, 80, 180);
+				dotSize = 3.f;
+				break;
+			case RobRunWorld::Kind::Cargo:
+				show = cfg.ShowContainers;
+				dotCol = IM_COL32(255, 230, 120, 200);
+				dotSize = 3.5f;
+				break;
+			case RobRunWorld::Kind::DrugWorkbench:
+				show = true;
+				dotCol = IM_COL32(0, 220, 100, 230);
+				dotSize = 4.5f;
+				break;
+			default:
+				show = cfg.ShowLoot;
+				dotCol = IM_COL32(180, 255, 180, 160);
+				dotSize = 2.5f;
+				break;
+			}
+			if (!show) continue;
+
+			ImVec2 sp = worldToScreen(ent.position.x, ent.position.z);
+			if (sp.x < clipMin.x - 8.f || sp.x > clipMax.x + 8.f ||
+				sp.y < clipMin.y - 8.f || sp.y > clipMax.y + 8.f)
+				continue;
+			dl->AddCircleFilled(sp, dotSize, dotCol);
+
+			if (cfg.ShowLootNames && !ent.label.empty()) {
+				ImVec2 ts = ImGui::CalcTextSize(ent.label.c_str());
+				dl->AddText(ImVec2(sp.x - ts.x * 0.5f, sp.y + dotSize + 1.f),
+					IM_COL32(220, 220, 220, 180), ent.label.c_str());
+			}
+		}
+	}
+
+	// Draw players
+	if (snapshot && cfg.ShowPlayers) {
+		for (const auto& ent : snapshot->entities) {
+			if (ent.isDead) continue;
+			const bool isLocal = ent.entityId == snapshot->localEntityId;
+
+			const RoleMarker marker = GetRoleMarker(ent.role, ent.roleName);
+			ImU32 badgeCol = marker.color;
+			if (isLocal) badgeCol = IM_COL32(50, 255, 120, 255);
+			else if (ent.isPartyMember) badgeCol = IM_COL32(50, 220, 100, 255);
+
+			ImVec2 sp = worldToScreen(ent.position.x, ent.position.z);
+			if (sp.x < clipMin.x - 16.f || sp.x > clipMax.x + 16.f ||
+				sp.y < clipMin.y - 16.f || sp.y > clipMax.y + 16.f)
+				continue;
+
+			const float r = isLocal ? 6.f : 5.f;
+			dl->AddCircleFilled(sp, r, IM_COL32(10, 12, 16, 220));
+			dl->AddCircle(sp, r, badgeCol, 0, 1.5f);
+
+			const char* txt = isLocal ? "ME" : marker.text;
+			ImVec2 ts = ImGui::CalcTextSize(txt);
+			ImVec2 tp(sp.x - ts.x * 0.5f, sp.y - ts.y * 0.5f);
+			dl->AddText(ImVec2(tp.x + 1.f, tp.y + 1.f), IM_COL32(0, 0, 0, 255), txt);
+			dl->AddText(tp, badgeCol, txt);
+
+			if (cfg.ShowPlayerNames && !ent.nickname.empty() && !isLocal) {
+				std::string nm = RobRunMemory::WideToUtf8(ent.nickname);
+				ImVec2 ns = ImGui::CalcTextSize(nm.c_str());
+				ImVec2 np(sp.x - ns.x * 0.5f, sp.y + r + 2.f);
+				dl->AddText(ImVec2(np.x + 1.f, np.y + 1.f), IM_COL32(0, 0, 0, 200),
+					nm.c_str());
+				dl->AddText(np, badgeCol, nm.c_str());
+			}
+		}
+	}
+
+	dl->PopClipRect();
+
+	// Zoom with mouse wheel, pan with middle-drag
+	if (ImGui::IsWindowHovered()) {
+		float wheel = ImGui::GetIO().MouseWheel;
+		if (wheel != 0.f)
+			ConfigInstance.Radar.Zoom = std::clamp(cfg.Zoom + wheel * 0.15f, 0.5f, 8.f);
+		if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.f)) {
+			ImVec2 d = ImGui::GetIO().MouseDelta;
+			s_pan.x += d.x;
+			s_pan.y += d.y;
+		}
+		if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Middle)) {
+			s_pan = ImVec2(0.f, 0.f);
+			ConfigInstance.Radar.Zoom = 1.f;
+		}
+	}
+
+	ImGui::End();
+	ImGui::PopStyleColor(3);
 	ImGui::PopStyleVar(2);
 }
 

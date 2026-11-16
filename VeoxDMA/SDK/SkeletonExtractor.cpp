@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "SkeletonExtractor.h"
+#include "DebugLog.h"
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -561,21 +562,45 @@ bool BuildLayoutFromView(U view, const Read& read, RigLayout& out)
         if (out.selected[b] && p >= 0 && out.selected[p])
             out.segments.push_back({p, b});
     }
-    // Direct parent-link fallback: if IK views didn't resolve segments,
-    // connect all valid bone pairs to guarantee skeletal completeness
-    if (out.segments.empty()) {
-        for (int b = 0; b < count; ++b) {
-            const int p = out.parent[b];
-            if (p >= 0 && p < count) {
-                const float dx = local[b].p.x;
-                const float dy = local[b].p.y;
-                const float dz = local[b].p.z;
-                const float distSq = dx*dx + dy*dy + dz*dz;
-                if (distSq > 0.0004f && distSq < 1.44f) {
-                    out.segments.push_back({p, b});
-                    out.selected[b] = 1;
-                    out.selected[p] = 1;
+    // Full rig: include all reachable non-facial bones so the complete
+    // joint hierarchy renders, not just the named anchor paths.
+    // NOTE: rh.parent was moved into out.parent above — ancestor() uses
+    // rh.isAncestor which would read a moved-from vector.  Use out.parent.
+    auto isAnc = [&](int a, int b) -> bool {
+        for (int steps = 0; b >= 0 && b < count && steps < count; b = out.parent[b], ++steps)
+            if (a == b) return true;
+        return false;
+    };
+    {
+        std::vector<bool> facial(count, false);
+        if (out.head >= 0) {
+            for (int b = 0; b < count; ++b) {
+                if (b == out.head) continue;
+                if (isAnc(out.head, b)) {
+                    bool keep = false;
+                    for (int a : anchors) if (a == b) { keep = true; break; }
+                    if (!keep) facial[b] = true;
                 }
+            }
+        }
+        // Only extend from leaf bones (no selected children) so we get
+        // fingers/toes but not random chest/spine helper branches.
+        std::vector<int> selChildCount(count, 0);
+        for (int b = 0; b < count; ++b)
+            if (out.selected[b] && out.parent[b] >= 0 && out.selected[out.parent[b]])
+                ++selChildCount[out.parent[b]];
+        for (int b = 0; b < count; ++b) {
+            if (facial[b] || !rh.reachable[b]) continue;
+            const int p = out.parent[b];
+            if (p < 0 || p >= count || facial[p] || !rh.reachable[p]) continue;
+            if (out.selected[b] || !out.selected[p]) continue;
+            if (selChildCount[p] > 0) continue;
+            const float dx = local[b].p.x, dy = local[b].p.y, dz = local[b].p.z;
+            const float distSq = dx*dx + dy*dy + dz*dz;
+            if (distSq > 0.0004f && distSq < 1.44f) {
+                out.segments.push_back({p, b});
+                out.selected[b] = 1;
+                out.selected[p] = 1;
             }
         }
     }
@@ -583,7 +608,8 @@ bool BuildLayoutFromView(U view, const Read& read, RigLayout& out)
 }
 
 static bool BuildPoseOutput(const RigLayout& layout, std::vector<TRS>& local,
-    std::vector<BoneSegment>& out, BonePoints* points, BoneLocal* localOut)
+    std::vector<BoneSegment>& out, BonePoints* points, BoneLocal* localOut,
+    Matrix4x4* worldMatricesOut = nullptr)
 {
     const int count = layout.count;
     std::vector<unsigned char> boneValid(static_cast<std::size_t>(count), 0);
@@ -630,6 +656,25 @@ static bool BuildPoseOutput(const RigLayout& layout, std::vector<TRS>& local,
                 world[b] = v;
                 worldValid[b] = 1;
             }
+        }
+    }
+
+    if (worldMatricesOut) {
+        for (int b = 0; b < count; ++b) {
+            auto& mat = worldMatricesOut[b];
+            if (!worldValid[b]) {
+                std::memset(&mat, 0, sizeof(Matrix4x4));
+                mat.matrix[0][0] = mat.matrix[1][1] = mat.matrix[2][2] = mat.matrix[3][3] = 1.0f;
+                continue;
+            }
+            const auto& q = worldRot[b];
+            const float xx = q.x*q.x, yy = q.y*q.y, zz = q.z*q.z;
+            const float xy = q.x*q.y, xz = q.x*q.z, yz = q.y*q.z;
+            const float wx = q.w*q.x, wy = q.w*q.y, wz = q.w*q.z;
+            mat.matrix[0][0] = 1-2*(yy+zz); mat.matrix[0][1] = 2*(xy+wz);   mat.matrix[0][2] = 2*(xz-wy);   mat.matrix[0][3] = 0;
+            mat.matrix[1][0] = 2*(xy-wz);   mat.matrix[1][1] = 1-2*(xx+zz); mat.matrix[1][2] = 2*(yz+wx);   mat.matrix[1][3] = 0;
+            mat.matrix[2][0] = 2*(xz+wy);   mat.matrix[2][1] = 2*(yz-wx);   mat.matrix[2][2] = 1-2*(xx+yy); mat.matrix[2][3] = 0;
+            mat.matrix[3][0] = world[b].x;   mat.matrix[3][1] = world[b].y;  mat.matrix[3][2] = world[b].z;  mat.matrix[3][3] = 1;
         }
     }
 
@@ -713,7 +758,7 @@ static bool BuildPoseOutput(const RigLayout& layout, std::vector<TRS>& local,
 
 bool SampleLayout(const RigLayout& layout, const Read& read,
     std::vector<BoneSegment>& out, BonePoints* points,
-    BoneLocal* localOut)
+    BoneLocal* localOut, Matrix4x4* worldMatricesOut)
 {
     const int count = layout.count;
     if (!read || layout.matrices <= 0x10000 || count < 2 ||
@@ -730,12 +775,13 @@ bool SampleLayout(const RigLayout& layout, const Read& read,
         if (!read(layout.matrices + offset, poseBytes + offset, chunk))
             return false;
     }
-    return BuildPoseOutput(layout, local, out, points, localOut);
+    return BuildPoseOutput(layout, local, out, points, localOut, worldMatricesOut);
 }
 
 bool ProcessPoseData(const RigLayout& layout, const void* poseData,
     std::size_t poseSize, std::vector<BoneSegment>& out,
-    BonePoints* points, BoneLocal* localOut)
+    BonePoints* points, BoneLocal* localOut,
+    Matrix4x4* worldMatricesOut)
 {
     const int count = layout.count;
     if (!poseData || count < 2 ||
@@ -747,22 +793,35 @@ bool ProcessPoseData(const RigLayout& layout, const void* poseData,
 
     std::vector<TRS> local(static_cast<std::size_t>(count));
     std::memcpy(local.data(), poseData, static_cast<std::size_t>(count) * sizeof(TRS));
-    return BuildPoseOutput(layout, local, out, points, localOut);
+    return BuildPoseOutput(layout, local, out, points, localOut, worldMatricesOut);
 }
 
 std::vector<BoneSegment> BuildFromView(U view, const Read& read)
 {
     RigLayout layout;
-    if (!BuildLayoutFromView(view, read, layout)) return {};
+    if (!BuildLayoutFromView(view, read, layout)) {
+        static int logCount = 0;
+        if (logCount++ < 5) DLOG("BuildFromView: BuildLayoutFromView failed (view=0x%llx)", (unsigned long long)view);
+        return {};
+    }
     std::vector<BoneSegment> result;
-    if (!SampleLayout(layout, read, result)) return {};
+    if (!SampleLayout(layout, read, result)) {
+        static int logCount = 0;
+        if (logCount++ < 5) DLOG("BuildFromView: SampleLayout failed (count=%d, segments=%zu)", layout.count, layout.segments.size());
+        return {};
+    }
     return result;
 }
 
 std::vector<BoneSegment> BuildSkeleton(
     U game, U battleModel, std::int32_t entityId, const Read& read)
 {
-    if (!read || battleModel <= 0x10000) return {};
+    static int lc = 0;
+    const bool log = lc < 10;
+    if (!read || battleModel <= 0x10000) {
+        if (log) { ++lc; DLOG("BuildSkeleton: early exit (read=%d bm=0x%llx)", !!read, (unsigned long long)battleModel); }
+        return {};
+    }
     Snapshot m{read,{}};
 
     // Verified active-updater path:
@@ -790,34 +849,62 @@ std::vector<BoneSegment> BuildSkeleton(
     // Legacy fallback chain retained for sessions where the active list has
     // not been populated yet.
     if (!updater) {
+        if (log) DLOG("BuildSkeleton: active-updater missed, trying legacy chain");
         const U chainOffsets[] = {0x98,0x20,0x50,0x18,0x90};
         const char* classes[] = {"Game","StartGameProcessor","ScreenManager",
             "BattleScreenUpdater","BattleUpdater","BattleEntitiesUpdater"};
         updater = game;
         for (int i = 0; i < 6; ++i) {
-            if (!m.is(updater,classes[i])) return {};
-            if (i == 4 && m.ptr(updater,0xE0) != battleModel) return {};
+            if (!m.is(updater,classes[i])) {
+                if (log) { ++lc; DLOG("BuildSkeleton: legacy chain failed at step %d (expected %s, got %s, addr=0x%llx)", i, classes[i], m.className(updater).c_str(), (unsigned long long)updater); }
+                return {};
+            }
+            if (i == 4 && m.ptr(updater,0xE0) != battleModel) {
+                if (log) { ++lc; DLOG("BuildSkeleton: legacy chain battleModel mismatch at step 4"); }
+                return {};
+            }
             if (i < 5) updater = m.ptr(updater,chainOffsets[i]);
         }
     }
+
+    if (log) DLOG("BuildSkeleton: updater=0x%llx, reading dict", (unsigned long long)updater);
 
     U dict = m.ptr(updater,0x110), entries = m.ptr(dict,0x18);
     std::int32_t used = 0;
     U capacity = 0;
     if (!dict || !entries || !m.get(dict+0x20,used) ||
         !m.get(entries+0x18,capacity) || used < 1 || used > 512 ||
-        capacity < static_cast<U>(used)) return {};
+        capacity < static_cast<U>(used)) {
+        if (log) { ++lc; DLOG("BuildSkeleton: dict read failed (dict=0x%llx entries=0x%llx used=%d cap=%llu)", (unsigned long long)dict, (unsigned long long)entries, used, (unsigned long long)capacity); }
+        return {};
+    }
     struct Entry { std::int32_t hash,next,key,pad; U value; };
     static_assert(sizeof(Entry) == 24 && offsetof(Entry,value) == 0x10);
     std::vector<Entry> slots(used);
-    if (!m.array(entries+0x20,slots,true)) return {};
+    if (!m.array(entries+0x20,slots,true)) {
+        if (log) { ++lc; DLOG("BuildSkeleton: array read failed (used=%d)", used); }
+        return {};
+    }
     U view = 0;
     for (const auto& e : slots) if (e.hash >= 0 && e.key == entityId) {
-        if (view || e.value <= 0x10000) return {};
+        if (view || e.value <= 0x10000) {
+            if (log) { ++lc; DLOG("BuildSkeleton: view lookup failed (dup=%d val=0x%llx)", !!view, (unsigned long long)e.value); }
+            return {};
+        }
         view = e.value;
     }
-    if (!m.is(view,"BattleCharacterEntityView")) return {};
-    return BuildFromView(view, read);
+    if (!view) {
+        if (log) { ++lc; DLOG("BuildSkeleton: entityId %d not found in dict (used=%d)", entityId, used); }
+        return {};
+    }
+    if (!m.is(view,"BattleCharacterEntityView")) {
+        if (log) { ++lc; DLOG("BuildSkeleton: view class check failed (view=0x%llx class=%s)", (unsigned long long)view, m.className(view).c_str()); }
+        return {};
+    }
+    if (log) DLOG("BuildSkeleton: calling BuildFromView (view=0x%llx entityId=%d)", (unsigned long long)view, entityId);
+    auto result = BuildFromView(view, read);
+    if (log) { ++lc; DLOG("BuildSkeleton: BuildFromView returned %zu bones", result.size()); }
+    return result;
 }
 
 bool ValidateHierarchy(const RigLayout& layout, const Read& read)
@@ -932,7 +1019,11 @@ bool BuildLayoutByName(U view, const Read& read, RigLayout& out)
     };
 
     auto nameContains = [](const std::string& haystack, const char* needle) {
-        return haystack.find(needle) != std::string::npos;
+        const auto pos = haystack.find(needle);
+        if (pos == std::string::npos) return false;
+        const auto end = pos + std::strlen(needle);
+        return end >= haystack.size() ||
+            !std::isalpha(static_cast<unsigned char>(haystack[end]));
     };
 
     for (const auto& bone : namedBones) {
