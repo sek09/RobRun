@@ -177,23 +177,30 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 		}
 	}
 	if (g_charMesh.valid && ent.boneWorldMatrices.size() >= 2) {
-		static std::vector<int> boneMap;
 		static std::vector<Vector3> skinned;
 		static bool loggedOnce = false;
 		if (!loggedOnce) {
-			DLOG("PlayerEsp: mesh chams path entered, boneWorldMatrices.size=%zu", ent.boneWorldMatrices.size());
+			DLOG("PlayerEsp: mesh chams path entered, boneWorldMatrices.size=%zu, boneMap.size=%zu",
+				ent.boneWorldMatrices.size(), ent.boneMap.size());
 			loggedOnce = true;
 		}
-		if (boneMap.size() != g_charMesh.numBones) {
-			boneMap.resize(g_charMesh.numBones);
-			for (std::uint32_t i = 0; i < g_charMesh.numBones; ++i)
-				boneMap[i] = static_cast<int>(i);
+
+		static const int kDefaultBoneMap[94] = {
+			9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 116, 130, 132, 133, 140, 141, 142, 143, 144, 146, 147, 148, 149, 150
+		};
+
+		const int* activeBoneMap = nullptr;
+		if (ent.boneMap.size() >= g_charMesh.numBones) {
+			activeBoneMap = ent.boneMap.data();
+		} else if (g_charMesh.numBones == 94) {
+			activeBoneMap = kDefaultBoneMap;
 		}
+
 		skinned.resize(g_charMesh.vertices.size());
 
 		const int safeBoneCount = static_cast<int>(ent.boneWorldMatrices.size());
 		CharacterMesh::Skin(g_charMesh, ent.boneWorldMatrices.data(),
-			safeBoneCount, boneMap.data(), skinned.data());
+			safeBoneCount, activeBoneMap, skinned.data());
 
 		if (CharacterMesh::Draw(dl, g_charMesh, skinned.data(), vp,
 			screenW, screenH, chamsCol))
@@ -521,6 +528,8 @@ void DrawPlayers()
 		if (ent.entityId == localId)
 			continue;
 		if (ent.isDead)
+			continue;
+		if (pcfg.HideTeammates && ent.isPartyMember)
 			continue;
 
 		const Vector3 entPos = ent.position;
@@ -861,6 +870,9 @@ void DrawPlayers()
 		if (ent.isKnockedOut) stateSegs.push_back({ "[KO]", stateCol });
 		if (ent.isSurrendered) stateSegs.push_back({ "[SUR]", stateCol });
 		if (ent.isHandcuffed) stateSegs.push_back({ "[HC]", stateCol });
+		if (pcfg.HiddenPlayerEsp && snapshot->world &&
+			snapshot->world->hiddenEntityIds.count(ent.entityId))
+			stateSegs.push_back({ "[HIDING]", IM_COL32(255, 165, 0, 255) });
 		if (pcfg.ShowRole)
 		{
 			ImU32 roleTextCol = roleCol;
@@ -994,5 +1006,69 @@ void DrawPlayers()
 		DLOG("DrawPlayers EXCEPTION #%d: %s", drawCount, e.what());
 	} catch (...) {
 		DLOG("DrawPlayers UNKNOWN EXCEPTION #%d", drawCount);
+	}
+}
+
+void DrawBvhDebug()
+{
+	if (!ConfigInstance.Player.ShowBvh) return;
+
+	const auto& scene = RobRunReader::GetBvhScene();
+	if (!scene.valid || scene.nodes.empty()) return;
+
+	const ImVec2 display = ImGui::GetIO().DisplaySize;
+	const int screenW = (int)display.x;
+	const int screenH = (int)display.y;
+	if (screenW <= 0 || screenH <= 0) return;
+
+	Matrix4x4 vp{};
+	if (!RobRunReader::ResolveViewProjection(vp, screenW, screenH)) return;
+
+	const auto snapshot = RobRunReader::GetSnapshot();
+	if (!snapshot) return;
+	const Vector3 cam = snapshot->localPosition;
+	const float maxDist = (float)ConfigInstance.Player.BvhDrawDist;
+	const float maxDistSq = maxDist * maxDist;
+
+	ImDrawList* dl = ImGui::GetBackgroundDrawList();
+	const ImU32 col = IM_COL32(0, 255, 255, 80);
+
+	for (const auto& node : scene.nodes) {
+		if (!node.isLeaf()) continue;
+
+		const float cx = (node.aabbMin.x + node.aabbMax.x) * 0.5f;
+		const float cy = (node.aabbMin.y + node.aabbMax.y) * 0.5f;
+		const float cz = (node.aabbMin.z + node.aabbMax.z) * 0.5f;
+		const float dx = cx - cam.x, dy = cy - cam.y, dz = cz - cam.z;
+		if (dx*dx + dy*dy + dz*dz > maxDistSq) continue;
+
+		Vector3 corners[8] = {
+			{node.aabbMin.x, node.aabbMin.y, node.aabbMin.z},
+			{node.aabbMax.x, node.aabbMin.y, node.aabbMin.z},
+			{node.aabbMax.x, node.aabbMax.y, node.aabbMin.z},
+			{node.aabbMin.x, node.aabbMax.y, node.aabbMin.z},
+			{node.aabbMin.x, node.aabbMin.y, node.aabbMax.z},
+			{node.aabbMax.x, node.aabbMin.y, node.aabbMax.z},
+			{node.aabbMax.x, node.aabbMax.y, node.aabbMax.z},
+			{node.aabbMin.x, node.aabbMax.y, node.aabbMax.z},
+		};
+
+		Vector2 sc[8];
+		bool allOk = true;
+		for (int i = 0; i < 8; ++i) {
+			if (!RobRunReader::ProjectWorld(vp, corners[i], screenW, screenH, sc[i])) {
+				allOk = false; break;
+			}
+		}
+		if (!allOk) continue;
+
+		static const int edges[12][2] = {
+			{0,1},{1,2},{2,3},{3,0},
+			{4,5},{5,6},{6,7},{7,4},
+			{0,4},{1,5},{2,6},{3,7},
+		};
+		for (const auto& e : edges)
+			dl->AddLine(ImVec2(sc[e[0]].x, sc[e[0]].y),
+			            ImVec2(sc[e[1]].x, sc[e[1]].y), col, 1.0f);
 	}
 }

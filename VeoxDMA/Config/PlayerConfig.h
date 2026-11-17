@@ -26,6 +26,8 @@ public:
 	D2D1::ColorF HiddenColour = Colour(255, 255, 255); // occluded / culled
 	bool WallCheck = false;
 	std::string BvhPath = "city_colliders.bvh";
+	bool ShowBvh = false;
+	int BvhDrawDist = 100;
 	// Project the ESP with the Unity render camera instead of the managed
 	// BattleCameraModel block. The managed block is read *after* memory aim
 	// writes its angles, so it already matches the frame being rendered; the
@@ -48,6 +50,8 @@ public:
 	bool ShowStamina = true;
 	bool SpectatorAlert = true;
 	bool WeaponSprite = true;
+	bool HideTeammates = false;
+	bool HiddenPlayerEsp = true;
 
 	D2D1::ColorF NameColour = Colour(255, 255, 255);
 	D2D1::ColorF DistanceColour = Colour(200, 200, 200);
@@ -67,7 +71,7 @@ public:
 	// points directly. PoseSmoothAlpha is the weight of the new sample: 1 keeps
 	// the pose raw, lower values damp jitter from partial or stale reads.
 	bool PoseSmoothing = true;
-	float PoseSmoothAlpha = 0.5f;
+	float PoseSmoothAlpha = 0.4f;
 
 	// Character 3D Capsule Chams (100% read-only DMA overlay silhouette)
 	bool Chams = false;
@@ -132,6 +136,8 @@ public:
         ToJsonColour(&j, LIT("HiddenColour"), &HiddenColour);
         j[ConfigName][LIT("WallCheck")] = WallCheck;
         j[ConfigName][LIT("BvhPath")] = BvhPath;
+        j[ConfigName][LIT("ShowBvh")] = ShowBvh;
+        j[ConfigName][LIT("BvhDrawDist")] = BvhDrawDist;
         j[ConfigName][LIT("NativeEspCameraV2")] = NativeEspCamera;
         j[ConfigName][LIT("WeaponEsp")] = WeaponEsp;
         j[ConfigName][LIT("LookingAtYou")] = LookingAtYou;
@@ -178,6 +184,8 @@ public:
         j[ConfigName][LIT("OffscreenArrows")] = OffscreenArrows;
         j[ConfigName][LIT("OffscreenRadius")] = OffscreenRadius;
         ToJsonColour(&j, LIT("OffscreenColour"), &OffscreenColour);
+        j[ConfigName][LIT("HideTeammates")] = HideTeammates;
+        j[ConfigName][LIT("HiddenPlayerEsp")] = HiddenPlayerEsp;
         j[ConfigName][LIT("HeadDot")] = HeadDot;
         j[ConfigName][LIT("HeadDotRadius")] = HeadDotRadius;
         ToJsonColour(&j, LIT("HeadDotColour"), &HeadDotColour);
@@ -201,6 +209,8 @@ public:
         FromJsonColour(j, LIT("HiddenColour"), &HiddenColour);
         WallCheck = j[ConfigName].value(LIT("WallCheck"), WallCheck);
         BvhPath = j[ConfigName].value(LIT("BvhPath"), BvhPath);
+        ShowBvh = j[ConfigName].value(LIT("ShowBvh"), ShowBvh);
+        BvhDrawDist = j[ConfigName].value(LIT("BvhDrawDist"), BvhDrawDist);
         NativeEspCamera = j[ConfigName].value(LIT("NativeEspCameraV2"), NativeEspCamera);
         WeaponEsp = j[ConfigName].value(LIT("WeaponEsp"), WeaponEsp);
         LookingAtYou = j[ConfigName].value(LIT("LookingAtYou"), LookingAtYou);
@@ -247,6 +257,8 @@ public:
         OffscreenArrows = j[ConfigName].value(LIT("OffscreenArrows"), OffscreenArrows);
         OffscreenRadius = j[ConfigName].value(LIT("OffscreenRadius"), OffscreenRadius);
         FromJsonColour(j, LIT("OffscreenColour"), &OffscreenColour);
+        HideTeammates = j[ConfigName].value(LIT("HideTeammates"), HideTeammates);
+        HiddenPlayerEsp = j[ConfigName].value(LIT("HiddenPlayerEsp"), HiddenPlayerEsp);
         HeadDot = j[ConfigName].value(LIT("HeadDot"), HeadDot);
         HeadDotRadius = j[ConfigName].value(LIT("HeadDotRadius"), HeadDotRadius);
         FromJsonColour(j, LIT("HeadDotColour"), &HeadDotColour);

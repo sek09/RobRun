@@ -9,6 +9,7 @@
 #include "Inventory.h"
 #include "WorldEntities.h"
 #include "SkeletonExtractor.h"
+#include "CollisionBVH.h"
 
 namespace RobRunReader {
 
@@ -70,6 +71,7 @@ struct EntityData {
     Skeleton::BonePoints bonePoints;
     // Per-bone world-space 4x4 matrices for mesh-based chams skinning.
     std::vector<Matrix4x4> boneWorldMatrices;
+    std::vector<int> boneMap;
     int boneCount = 0;
 };
 
@@ -82,6 +84,7 @@ struct Snapshot {
     // of milliseconds. They run on their own thread and publish immutable
     // states, so the player/pose pass never waits for them.
     std::shared_ptr<const RobRunWorld::State> world;
+    std::shared_ptr<const RobRunWorld::PlotState> plots;
     std::shared_ptr<const RobRunInventory::State> inventory;
     RobRunCamera::CameraState camera;
     std::int32_t localEntityId = -1;
@@ -215,6 +218,7 @@ struct BvhStatus {
 };
 BvhStatus GetBvhStatus();
 void ReloadBvh();
+const CollisionBVH::Scene& GetBvhScene();
 
 bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin = 0.20f);
 bool IsCameraOccluded(const Vector3& target, float tMin = 0.20f);

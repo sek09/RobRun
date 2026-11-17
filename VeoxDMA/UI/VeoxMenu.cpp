@@ -162,7 +162,7 @@ bool g_placementApplied = false;
 char g_search[96] = "";
 bool g_readCatalog = false;
 
-const char* kPageNames[] = { "Visuals", "Radar", "Aim", "Server", "Misc", "Settings" };
+const char* kPageNames[] = { "Visuals", "Radar", "Loot Filter", "Aim", "Server", "Misc", "Settings" };
 constexpr int kPageCount = IM_ARRAYSIZE(kPageNames);
 
 ID3D11ShaderResourceView* g_icon[kPageCount] = {};
@@ -973,9 +973,11 @@ void DrawVisuals()
 
 	ImGui::BeginGroup();
 	{
-		if (MatchAny({ "Box ESP", "Health", "Distance", "Snaplines", "Off-Screen Indicators", "Head Dot" }))
+		if (MatchAny({ "Box ESP", "Health", "Distance", "Snaplines", "Off-Screen Indicators", "Head Dot", "Hide Teammates", "Hidden Player ESP" }))
 		{
 			BeginCard("PLAYER ESP", kCardW);
+			ToggleRow("Hide Teammates", &ConfigInstance.Player.HideTeammates);
+			ToggleRow("Hidden Player ESP", &ConfigInstance.Player.HiddenPlayerEsp);
 			ColorToggleRow("Box ESP", &ConfigInstance.Player.BoxEsp, ConfigInstance.Player.BoxColour);
 			ColorToggleRow("Health", &ConfigInstance.Player.Health, ConfigInstance.Player.HealthTextColour);
 			ColorToggleRow("Distance", &ConfigInstance.Player.Distance, ConfigInstance.Player.DistanceColour);
@@ -1021,7 +1023,7 @@ void DrawVisuals()
 		}
 
 		if (MatchAny({ "Skeleton", "Draw Skeleton", "Chams", "Character Chams", "Limb Thickness",
-			"VisCheck", "WallCheck", "Interpolate", "Lead", "Native Camera" }))
+			"VisCheck", "WallCheck", "BVH", "Interpolate", "Lead", "Native Camera" }))
 		{
 			BeginCard("SKELETON & CHAMS", kCardW);
 			ToggleRow("Draw Skeleton", &ConfigInstance.Player.Skeleton);
@@ -1069,6 +1071,9 @@ void DrawVisuals()
 				{
 					RobRunReader::ReloadBvh();
 				}
+				ToggleRow("Show BVH", &ConfigInstance.Player.ShowBvh);
+				if (ConfigInstance.Player.ShowBvh)
+					SliderIntRow("Draw Dist", &ConfigInstance.Player.BvhDrawDist, 10, 500, "m");
 			}
 
 			ToggleRow("Pose Smoothing", &ConfigInstance.Player.PoseSmoothing);
@@ -1152,6 +1157,10 @@ void DrawVisuals()
 			ToggleRow("Crypto Workbenches", &ConfigInstance.World.CryptoWorkbenches);
 			ToggleRow("Vehicle Trunks", &ConfigInstance.World.VehicleTrunks);
 			ToggleRow("Drug Labs", &ConfigInstance.World.DrugWorkbenches);
+			ToggleRow("Weed", &ConfigInstance.World.Weed);
+			ToggleRow("Defense Blocks", &ConfigInstance.World.DefenseBlocks);
+			ToggleRow("House Info", &ConfigInstance.World.HouseEsp);
+			SliderIntRow("House Range", &ConfigInstance.World.HouseMaxDistance, 50, 1000, "m");
 			SliderIntRow("Max Distance", &ConfigInstance.World.MaxDistance, 0, 2000, "m");
 			SliderIntRow("Min Cash / Value", &ConfigInstance.World.MinValueFilter, 0, 50000, " $");
 			SliderIntRow("Font Size", &ConfigInstance.World.FontSize, 1, 24, "px");
@@ -1213,6 +1222,201 @@ void DrawRadar()
 		}
 		Note("The radar reads entity positions from the same snapshot as the ESP. "
 			"Bounds calibrate where positions land on the map.");
+		EndCard();
+	}
+	ImGui::EndGroup();
+}
+
+void DrawLootFilter()
+{
+	static char s_itemSearch[128] = "";
+	static bool s_searchInit = false;
+	if (!s_searchInit) {
+		std::strncpy(s_itemSearch, ConfigInstance.LootFilter.ItemSearchQuery.c_str(), sizeof(s_itemSearch) - 1);
+		s_searchInit = true;
+	}
+
+	if (!g_singleColumn)
+	{
+		const float r1 = ImMax(CardNaturalHeight("LOOT FILTER & MAP"), CardNaturalHeight("PRICE CUSTOMIZATION"));
+		const float r2 = ImMax(CardNaturalHeight("VALUABLES & CASH"), CardNaturalHeight("CONTAINERS & SAFES"));
+		const float r3 = ImMax(CardNaturalHeight("WORLD & LOOSE LOOT"), CardNaturalHeight("ITEM SEARCH & QUICK PRESETS"));
+		ForceCardHeight("LOOT FILTER & MAP", r1);
+		ForceCardHeight("PRICE CUSTOMIZATION", r1);
+		ForceCardHeight("VALUABLES & CASH", r2);
+		ForceCardHeight("CONTAINERS & SAFES", r2);
+		ForceCardHeight("WORLD & LOOSE LOOT", r3);
+		ForceCardHeight("ITEM SEARCH & QUICK PRESETS", r3);
+	}
+
+	// Column 1
+	ImGui::BeginGroup();
+	{
+		BeginCard("LOOT FILTER & MAP", kCardW);
+		ToggleRow("Enable Loot Filter", &ConfigInstance.LootFilter.Enabled);
+		ToggleRow("Show All Loot on Map", &ConfigInstance.LootFilter.ShowAllOnMap);
+		ToggleRow("Show Loot on Minimap", &ConfigInstance.LootFilter.ShowOnMinimap);
+		ToggleRow("Show Loot Names", &ConfigInstance.LootFilter.ShowNames);
+		ToggleRow("Show Loot Prices", &ConfigInstance.LootFilter.ShowPrices);
+		ToggleRow("Show Distance", &ConfigInstance.LootFilter.ShowDistance);
+		ToggleRow("Hide Empty Containers", &ConfigInstance.LootFilter.HideEmpty);
+
+		SectionLabel("DISPLAY METRICS");
+		SliderFloatRow("Base Dot Size", &ConfigInstance.LootFilter.BaseDotSize, 1.5f, 8.0f, "px");
+		SliderIntRow("Max Distance", &ConfigInstance.LootFilter.MaxDistance, 0, 3000, "m");
+		EndCard();
+
+		BeginCard("VALUABLES & CASH", kCardW);
+		ColorToggleRow("Cash Loot Nodes", &ConfigInstance.LootFilter.CashNodes, ConfigInstance.LootFilter.CashNodeColour);
+		ColorToggleRow("Settlement Cash", &ConfigInstance.LootFilter.SettlementCash, ConfigInstance.LootFilter.SettlementCashColour);
+		ColorToggleRow("Money Workbenches", &ConfigInstance.LootFilter.MoneyWorkbenches, ConfigInstance.LootFilter.MoneyWorkbenchColour);
+		ColorToggleRow("Collection Tables", &ConfigInstance.LootFilter.CollectionTables, ConfigInstance.LootFilter.CollectionTableColour);
+		ColorToggleRow("Dropped Bags", &ConfigInstance.LootFilter.DroppedBags, ConfigInstance.LootFilter.DroppedBagColour);
+		ColorToggleRow("Crypto Workbenches", &ConfigInstance.LootFilter.CryptoWorkbenches, ConfigInstance.LootFilter.CryptoColour);
+		ColorToggleRow("Drug Labs", &ConfigInstance.LootFilter.DrugLabs, ConfigInstance.LootFilter.DrugLabColour);
+		EndCard();
+
+		BeginCard("WORLD & LOOSE LOOT", kCardW);
+		ColorToggleRow("Static Loot", &ConfigInstance.LootFilter.StaticLoot, ConfigInstance.LootFilter.StaticLootColour);
+		ColorToggleRow("Random Loot", &ConfigInstance.LootFilter.RandomLoot, ConfigInstance.LootFilter.RandomLootColour);
+		ColorToggleRow("Vehicle Loot", &ConfigInstance.LootFilter.VehicleLoot, ConfigInstance.LootFilter.VehicleLootColour);
+		ColorToggleRow("Cargo Drops", &ConfigInstance.LootFilter.Cargo, ConfigInstance.LootFilter.CargoColour);
+		ColorToggleRow("Plot Loot", &ConfigInstance.LootFilter.PlotLoot, ConfigInstance.LootFilter.PlotLootColour);
+		ColorToggleRow("Furniture Loot", &ConfigInstance.LootFilter.FurnitureLoot, ConfigInstance.LootFilter.FurnitureLootColour);
+		ColorToggleRow("Building Loot", &ConfigInstance.LootFilter.BuildingLoot, ConfigInstance.LootFilter.BuildingLootColour);
+		EndCard();
+	}
+	ImGui::EndGroup();
+
+	if (!g_singleColumn)
+		ImGui::SameLine(0.f, kGap);
+
+	// Column 2
+	ImGui::BeginGroup();
+	{
+		BeginCard("PRICE CUSTOMIZATION", kCardW);
+		Note("Customize loot visibility and color tiers based on dollar value.");
+		ToggleRow("Filter By Min Price", &ConfigInstance.LootFilter.FilterByMinPrice);
+		SliderIntRow("Min Loot Price", &ConfigInstance.LootFilter.MinPrice, 0, 50000, " $");
+
+		SectionLabel("VALUE TIERS & HIGHLIGHTS");
+		SliderIntRow("High Value >= ", &ConfigInstance.LootFilter.HighValueThreshold, 1000, 100000, " $");
+		ColorRow("High Value Color", ConfigInstance.LootFilter.HighValueColour);
+		ToggleRow("High Value Ring Indicator", &ConfigInstance.LootFilter.HighValuePulse);
+
+		SliderIntRow("Mid Value >= ", &ConfigInstance.LootFilter.MidValueThreshold, 500, 50000, " $");
+		ColorRow("Mid Value Color", ConfigInstance.LootFilter.MidValueColour);
+		ColorRow("Standard Loot Color", ConfigInstance.LootFilter.StandardColour);
+		EndCard();
+
+		BeginCard("CONTAINERS & SAFES", kCardW);
+		ColorToggleRow("Safe Doors", &ConfigInstance.LootFilter.SafeDoors, ConfigInstance.LootFilter.SafeDoorColour);
+		ColorToggleRow("Storage Boxes", &ConfigInstance.LootFilter.StorageBoxes, ConfigInstance.LootFilter.StorageBoxColour);
+		ColorToggleRow("Shelving", &ConfigInstance.LootFilter.Shelving, ConfigInstance.LootFilter.ShelvingColour);
+		ColorToggleRow("Plot Containers", &ConfigInstance.LootFilter.PlotContainers, ConfigInstance.LootFilter.PlotContainerColour);
+		ColorToggleRow("Loot Nodes", &ConfigInstance.LootFilter.LootNodes, ConfigInstance.LootFilter.LootNodeColour);
+		ColorToggleRow("General Containers", &ConfigInstance.LootFilter.Containers, ConfigInstance.LootFilter.ContainerColour);
+		ColorToggleRow("Vehicle Trunks", &ConfigInstance.LootFilter.VehicleTrunks, ConfigInstance.LootFilter.VehicleTrunkColour);
+		ColorToggleRow("First Aid Cabinets", &ConfigInstance.LootFilter.FirstAid, ConfigInstance.LootFilter.FirstAidColour);
+		EndCard();
+
+		BeginCard("ITEM SEARCH & QUICK PRESETS", kCardW);
+		SectionLabel("FILTER BY NAME / ITEM");
+		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+		if (ImGui::InputTextWithHint("##loot_filter_search", "Search item or container name...", s_itemSearch, sizeof(s_itemSearch))) {
+			ConfigInstance.LootFilter.ItemSearchQuery = s_itemSearch;
+		}
+
+		SectionLabel("QUICK PRESETS");
+		if (ButtonRow("", "Show All Loot", 140.f, true)) {
+			ConfigInstance.LootFilter.ShowAllOnMap = true;
+			ConfigInstance.LootFilter.FilterByMinPrice = false;
+			ConfigInstance.LootFilter.MinPrice = 0;
+			s_itemSearch[0] = '\0';
+			ConfigInstance.LootFilter.ItemSearchQuery.clear();
+			ConfigInstance.LootFilter.CashNodes = true;
+			ConfigInstance.LootFilter.SettlementCash = true;
+			ConfigInstance.LootFilter.MoneyWorkbenches = true;
+			ConfigInstance.LootFilter.CollectionTables = true;
+			ConfigInstance.LootFilter.DroppedBags = true;
+			ConfigInstance.LootFilter.CryptoWorkbenches = true;
+			ConfigInstance.LootFilter.DrugLabs = true;
+			ConfigInstance.LootFilter.SafeDoors = true;
+			ConfigInstance.LootFilter.StorageBoxes = true;
+			ConfigInstance.LootFilter.Shelving = true;
+			ConfigInstance.LootFilter.PlotContainers = true;
+			ConfigInstance.LootFilter.LootNodes = true;
+			ConfigInstance.LootFilter.Containers = true;
+			ConfigInstance.LootFilter.VehicleTrunks = true;
+			ConfigInstance.LootFilter.FirstAid = true;
+			ConfigInstance.LootFilter.StaticLoot = true;
+			ConfigInstance.LootFilter.RandomLoot = true;
+			ConfigInstance.LootFilter.VehicleLoot = true;
+			ConfigInstance.LootFilter.Cargo = true;
+			ConfigInstance.LootFilter.PlotLoot = true;
+			ConfigInstance.LootFilter.FurnitureLoot = true;
+			ConfigInstance.LootFilter.BuildingLoot = true;
+		}
+
+		if (ButtonRow("", "Only Cash & Bags", 140.f)) {
+			ConfigInstance.LootFilter.Containers = false;
+			ConfigInstance.LootFilter.LootNodes = false;
+			ConfigInstance.LootFilter.StorageBoxes = false;
+			ConfigInstance.LootFilter.Shelving = false;
+			ConfigInstance.LootFilter.PlotContainers = false;
+			ConfigInstance.LootFilter.VehicleTrunks = false;
+			ConfigInstance.LootFilter.StaticLoot = false;
+			ConfigInstance.LootFilter.RandomLoot = false;
+			ConfigInstance.LootFilter.VehicleLoot = false;
+			ConfigInstance.LootFilter.PlotLoot = false;
+			ConfigInstance.LootFilter.FurnitureLoot = false;
+			ConfigInstance.LootFilter.BuildingLoot = false;
+			ConfigInstance.LootFilter.CashNodes = true;
+			ConfigInstance.LootFilter.SettlementCash = true;
+			ConfigInstance.LootFilter.MoneyWorkbenches = true;
+			ConfigInstance.LootFilter.CollectionTables = true;
+			ConfigInstance.LootFilter.DroppedBags = true;
+			ConfigInstance.LootFilter.SafeDoors = true;
+			ConfigInstance.LootFilter.CryptoWorkbenches = true;
+			ConfigInstance.LootFilter.DrugLabs = true;
+		}
+
+		if (ButtonRow("", "High Value ($10k+)", 140.f)) {
+			ConfigInstance.LootFilter.FilterByMinPrice = true;
+			ConfigInstance.LootFilter.MinPrice = 10000;
+		}
+
+		SectionLabel("LIVE MAP LOOT STATS");
+		const auto snapshot = RobRunReader::GetSnapshot();
+		if (snapshot && snapshot->world && snapshot->world->valid) {
+			int totalCash = 0;
+			int highestCash = 0;
+			int cashCount = 0;
+			int containerCount = 0;
+			int looseCount = 0;
+			for (const auto& ent : snapshot->world->entities) {
+				if (ent.hasCashAmount && ent.cashAmount > 0) {
+					totalCash += ent.cashAmount;
+					cashCount++;
+					if (ent.cashAmount > highestCash) highestCash = ent.cashAmount;
+				}
+				if (ent.kind == RobRunWorld::Kind::Container || ent.kind == RobRunWorld::Kind::SafeDoor ||
+					ent.kind == RobRunWorld::Kind::StorageBox || ent.kind == RobRunWorld::Kind::Shelving ||
+					ent.kind == RobRunWorld::Kind::PlotContainer || ent.kind == RobRunWorld::Kind::LootNode) {
+					containerCount++;
+				} else if (ent.kind == RobRunWorld::Kind::StaticLoot || ent.kind == RobRunWorld::Kind::RandomLoot ||
+					ent.kind == RobRunWorld::Kind::Loot || ent.kind == RobRunWorld::Kind::VehicleLoot ||
+					ent.kind == RobRunWorld::Kind::DroppedBag) {
+					looseCount++;
+				}
+			}
+			Note("Detected Entities: %zu on map", snapshot->world->entities.size());
+			Note("Valuables on Map: %d (Total: $%s)", cashCount, FormatCash(totalCash).c_str());
+			Note("Top Value Spot: $%s", FormatCash(highestCash).c_str());
+			Note("Containers: %d | Loose Loot: %d", containerCount, looseCount);
+		} else {
+			Note("No world snapshot yet. In raid, live stats will appear here.");
+		}
 		EndCard();
 	}
 	ImGui::EndGroup();
@@ -1316,6 +1520,7 @@ void DrawAim()
 			SliderIntRow("Vertical Lead", &ConfigInstance.Aim.PredictionYScale, 0, 100, "%");
 		}
 		ToggleRow("Hard Lock", &ConfigInstance.Aim.HardLock);
+		SliderIntRow("Switch Delay", &ConfigInstance.Aim.TargetSwitchDelay, 0, 1000, "ms");
 		EndCard();
 	}
 	ImGui::EndGroup();
@@ -1341,6 +1546,7 @@ void DrawAim()
 		ToggleRow("Skip Police Officer targets", &ConfigInstance.Aim.ExpIgnorePolice);
 		ToggleRow("Skip Criminal targets", &ConfigInstance.Aim.ExpIgnoreCriminal);
 		ToggleRow("Skip Civilian targets", &ConfigInstance.Aim.ExpIgnoreCivilian);
+		ToggleRow("Skip Knocked Players", &ConfigInstance.Aim.SkipKnocked);
 		ToggleRow("Ignore Teammates", &ConfigInstance.Aim.ExpIgnoreTeammates);
 		if (ConfigInstance.Aim.ExpIgnoreTeammates)
 			Note("Uses party membership, not role: same-role players outside your party stay targetable.");
@@ -2581,10 +2787,11 @@ void Init()
 	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 	g_icon[0] = LoadTextureFromMemory(visuals, sizeof(visuals));
 	g_icon[1] = LoadTextureFromMemory(world, sizeof(world));
-	g_icon[2] = LoadTextureFromMemory(ragebot, sizeof(ragebot));
-	g_icon[3] = LoadTextureFromMemory(world, sizeof(world));
-	g_icon[4] = LoadTextureFromMemory(misc, sizeof(misc));
-	g_icon[5] = LoadTextureFromMemory(settings, sizeof(settings));
+	g_icon[2] = LoadTextureFromMemory(world, sizeof(world));
+	g_icon[3] = LoadTextureFromMemory(ragebot, sizeof(ragebot));
+	g_icon[4] = LoadTextureFromMemory(world, sizeof(world));
+	g_icon[5] = LoadTextureFromMemory(misc, sizeof(misc));
+	g_icon[6] = LoadTextureFromMemory(settings, sizeof(settings));
 }
 
 void Draw(bool attached, const std::string& statusText)
@@ -2769,10 +2976,11 @@ void Draw(bool attached, const std::string& statusText)
 		{
 		case 0: DrawVisuals(); break;
 		case 1: DrawRadar(); break;
-		case 2: DrawAim(); break;
-		case 3: DrawServer(); break;
-		case 4: DrawMisc(); break;
-		case 5: DrawSettings(attached, statusText); break;
+		case 2: DrawLootFilter(); break;
+		case 3: DrawAim(); break;
+		case 4: DrawServer(); break;
+		case 5: DrawMisc(); break;
+		case 6: DrawSettings(attached, statusText); break;
 		default: break;
 		}
 
