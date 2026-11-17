@@ -33,7 +33,6 @@ bool g_menuOpen = true;
 bool g_transparent = false;
 bool g_clickThrough = true;
 bool g_alwaysOnTop = true;
-int g_frameCap = 144;
 std::atomic<bool> g_requestExit{ false };
 
 #ifdef _DEBUG
@@ -172,7 +171,7 @@ void WaitForFrameCap()
 	static clock::time_point next{};
 	static int lastCap = -1;
 
-	const int cap = g_frameCap;
+	const int cap = Overlay::FrameCap();
 	const auto now = clock::now();
 
 	if (cap <= 0)
@@ -190,7 +189,7 @@ void WaitForFrameCap()
 		// display change): start a fresh schedule instead of firing a burst
 		// of catch-up frames.
 		lastCap = cap;
-		next = now + interval;
+		next = now;
 		return;
 	}
 
@@ -294,7 +293,8 @@ void DrawDebugOverlay()
 
 	line("VeoxDMA  Overlay  Debug", amber);
 	char capBuf[16];
-	if (g_frameCap > 0) std::snprintf(capBuf, sizeof(capBuf), "%d", g_frameCap);
+	const int cap = Overlay::FrameCap();
+	if (cap > 0) std::snprintf(capBuf, sizeof(capBuf), "%d", cap);
 	else std::snprintf(capBuf, sizeof(capBuf), "off");
 	std::snprintf(buf, sizeof(buf), "FPS: %.0f   Frame cap: %s", io.Framerate, capBuf);
 	line(buf, white);
@@ -378,12 +378,15 @@ void SetAlwaysOnTop(bool on)
 	g_appliedChrome.valid = false;
 }
 
-int FrameCap() { return g_frameCap; }
+int FrameCap()
+{
+	const int cap = ConfigInstance.Overlay.FrameCap;
+	return cap < 0 ? 144 : std::min(cap, 1000);
+}
 
 void SetFrameCap(int fps)
 {
-	g_frameCap = std::clamp(fps, 0, 1000);
-	ConfigInstance.Overlay.FrameCap = g_frameCap;
+	ConfigInstance.Overlay.FrameCap = std::clamp(fps, 0, 1000);
 }
 
 int MonitorCount() { return (int)g_monitors.size(); }
@@ -455,7 +458,6 @@ int Run(HINSTANCE instance, const wchar_t* title, const wchar_t* windowClass,
 	g_transparent = ConfigInstance.Overlay.Transparent;
 	g_clickThrough = ConfigInstance.Overlay.ClickThroughWhenClosed;
 	g_alwaysOnTop = ConfigInstance.Overlay.AlwaysOnTop;
-	g_frameCap = ConfigInstance.Overlay.FrameCap > 0 ? std::clamp(ConfigInstance.Overlay.FrameCap, 0, 1000) : 144;
 	g_appliedChrome.valid = false;
 
 	ImGui_ImplWin32_EnableDpiAwareness();

@@ -2154,9 +2154,10 @@ void DrawMisc()
 			const auto snapshot = RobRunReader::GetSnapshot();
 			if (snapshot)
 			{
-				const auto world = snapshot->world ? *snapshot->world : RobRunWorld::State{};
+				const auto* world = snapshot->world.get();
 				Note("Entities %zu  (C:%d L:%d V:%d G:%d)", snapshot->entities.size(),
-					world.containers, world.loots, world.vehicles, world.grenades);
+					world ? world->containers : 0, world ? world->loots : 0,
+					world ? world->vehicles : 0, world ? world->grenades : 0);
 				Note("Skeletons %u | Aim poses %u | Pose retries %u", snapshot->skeletonCount,
 					snapshot->poseCount, snapshot->poseFailures);
 				Note("Read failures %u", snapshot->failureCount);
