@@ -39,7 +39,7 @@ public:
 	// Draws the live aim state (key source, candidate count, chosen target,
 	// pixel delta, write verdict and the reason the loop stopped) in the
 	// top-left corner.
-	bool ShowDebug = true;
+	bool ShowDebug = false; // controlled by Settings > Display > Show Debug Info
 	// Only consider characters whose animator is still evaluating (the same
 	// per-character state the ESP colours as "visible"). This is an
 	// animator/cull check, not wall occlusion: read-only DMA cannot tell

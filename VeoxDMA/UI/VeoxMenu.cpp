@@ -1561,7 +1561,6 @@ void DrawAim()
 			}
 		}
 		ToggleRow("Show FOV Circle", &ConfigInstance.Aim.ShowFov);
-		ToggleRow("Show Aim Debug", &ConfigInstance.Aim.ShowDebug);
 		EndCard();
 
 		BeginCard("DEVICE", kCardW);
@@ -2289,6 +2288,8 @@ void DrawSettings(bool attached, const std::string& statusText)
 
 		BeginCard("DISPLAY", kCardW);
 		ToggleRow("Show FPS", &ConfigInstance.Overlay.FPSEnabled);
+		ToggleRow("Show Debug Info", &ConfigInstance.Aim.ShowDebug);
+		Note("Shows the top-left Aim, Menu, Entities and camera debug readout.");
 
 		{
 			static const char* fontNames[kFontCount];
