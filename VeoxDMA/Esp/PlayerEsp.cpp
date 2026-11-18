@@ -85,6 +85,23 @@ static inline bool IsValidBone(const Vector3& p, const Vector3& root)
 	return d >= 0.01f && d <= 2.5f;
 }
 
+static bool FindOnScreenAnchor(const RobRunReader::EntityData& ent, const Matrix4x4& vp,
+	int width, int height, ImVec2& anchor)
+{
+	auto onScreen = [&](const Vector3& point) {
+		return Project(vp, point, width, height, anchor) &&
+			anchor.x >= 0.f && anchor.x <= width && anchor.y >= 0.f && anchor.y <= height;
+	};
+	if (onScreen(ent.position)) return true;
+
+	// A visible upper body can still be in frame when the feet fall outside it.
+	// Only use points present in this frame; a missing pose is not a position.
+	if (!ent.visible) return false;
+	const auto& pose = ent.bonePoints;
+	return (pose.hasChest && IsValidBone(pose.chest, ent.position) && onScreen(pose.chest)) ||
+		(pose.hasHead && IsValidBone(pose.head, ent.position) && onScreen(pose.head));
+}
+
 static inline bool IsValidBoneSegment(const Vector3& a, const Vector3& b, const Vector3& root)
 {
 	if (!IsValidBone(a, root) || !IsValidBone(b, root))
@@ -551,12 +568,7 @@ void DrawPlayers()
 		}
 
 		ImVec2 screenPos{};
-		const bool projected = Project(viewProjection, entPos, screenW, screenH, screenPos);
-		const bool onScreen = projected &&
-			screenPos.x >= 0.f && screenPos.x <= (float)screenW &&
-			screenPos.y >= 0.f && screenPos.y <= (float)screenH;
-
-		if (!onScreen)
+		if (!FindOnScreenAnchor(ent, viewProjection, screenW, screenH, screenPos))
 		{
 			if (pcfg.OffscreenArrows && snapshot->camera.valid)
 			{
