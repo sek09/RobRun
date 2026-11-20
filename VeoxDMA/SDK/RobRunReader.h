@@ -41,6 +41,11 @@ struct EntityData {
     std::wstring nickname;
     std::wstring clanTag;
     std::wstring weaponName;
+    // UTF-8 copies for the ESP/radar, built once per reader pass. Converting
+    // per entity per rendered frame allocated several strings at 144 Hz.
+    std::string nicknameUtf8;
+    std::string clanTagUtf8;
+    std::string weaponNameUtf8;
     int weaponIndex = -1;
     bool isFiring = false;
     bool isReloading = false;
@@ -109,6 +114,16 @@ struct Snapshot {
     // Players whose fresh pose read failed on the last pass. They keep their
     // previous bones instead of accepting a cached (visibly trailing) pose.
     std::uint32_t poseFailures = 0;
+    // Bone jitter diagnostics: per-pass aggregate across all entities.
+    std::uint32_t boneTotal = 0;        // total bones evaluated
+    std::uint32_t boneInvalid = 0;      // failed TRS validation
+    std::uint32_t boneNormZero = 0;     // quaternion norm ~0 (unread/zeroed)
+    std::uint32_t boneNormBad = 0;      // quaternion norm outside [0.5,1.5] but > 0
+    std::uint32_t bonePosInf = 0;       // non-finite position
+    std::uint32_t boneChainDrop = 0;    // valid TRS but parent invalid (chain break)
+    std::uint32_t poseScatterOk = 0;    // ProcessPoseData succeeded
+    std::uint32_t poseScatterFail = 0;  // ProcessPoseData failed, tried fresh
+    std::uint32_t poseFreshOk = 0;      // SampleLayout fallback succeeded
     Matrix4x4 fallbackViewProjection{};
     bool fallbackViewProjectionValid = false;
     // Publish time (GetTickCount64). Lets the overlay report how old the pose
@@ -162,6 +177,12 @@ void SetReadCatalogEnabled(bool enabled);
 // render thread (e.g. the overlay tick callback) so camera projection stays
 // in sync with the game frame instead of trailing the worker by ~33 ms.
 void RefreshCamera();
+
+// Returns the camera written by the most recent RefreshCamera() call (or the
+// worker's copy when the render path has not run yet). Aim uses this instead of
+// snapshot->camera so its angles are solved from the same camera the on-screen
+// projection was built with; the worker snapshot trails by up to one cycle.
+bool GetFreshCamera(RobRunCamera::CameraState& out);
 
 // Builds the view-projection from the verified BattleCameraModel. Returns
 // false when the camera path is unavailable; callers can then use
@@ -220,7 +241,8 @@ BvhStatus GetBvhStatus();
 void ReloadBvh();
 const CollisionBVH::Scene& GetBvhScene();
 
-bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin = 0.20f);
-bool IsCameraOccluded(const Vector3& target, float tMin = 0.20f);
+bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin = 0.20f, bool checkDynamic = true);
+bool IsCameraOccluded(const Vector3& target, float tMin = 0.20f, bool checkDynamic = true);
+CollisionBVH::DynamicOccluders GetDynamicOccluders();
 
 } // namespace RobRunReader

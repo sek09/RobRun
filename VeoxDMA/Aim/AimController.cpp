@@ -670,11 +670,27 @@ void StartAimWorker()
     StopAimWorker();
     g_aimWorkerStop.store(false, std::memory_order_relaxed);
     g_aimWorkerThread = std::thread([] {
+        using clock = std::chrono::steady_clock;
+        auto lastTick = clock::now() - std::chrono::seconds(1);
+        auto lastLoot = clock::now() - std::chrono::seconds(1);
         while (!g_aimWorkerStop.load(std::memory_order_relaxed)) {
-            RobRunReader::RefreshCamera();
-            Tick();
-            TickRecoilSpread();
-            TickInstantLoot();
+            const auto now = clock::now();
+            try {
+                // Camera refresh stays at the loop rate (one scatter read); the
+                // full entity scan and the loot poke do not need 500 Hz. The
+                // write path is throttled to 16 ms and the device to 6 ms, so
+                // running the scan faster than that only burns CPU.
+                RobRunReader::RefreshCamera();
+                if (now - lastTick >= std::chrono::milliseconds(6)) {
+                    lastTick = now;
+                    Tick();
+                    TickRecoilSpread();
+                }
+                if (now - lastLoot >= std::chrono::milliseconds(50)) {
+                    lastLoot = now;
+                    TickInstantLoot();
+                }
+            } catch (...) {}
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
     });
@@ -811,11 +827,21 @@ static void DumpAimFieldsOnce()
 void Tick()
 {
     const auto& cfg = ConfigInstance.Aim;
-    g_debug = DebugInfo{};
-    g_debug.enabled = cfg.Enabled;
-    g_debug.menuOpen = Overlay::MenuOpen();
-    g_debug.aimType = cfg.AimType;
-    g_debug.deviceReady = Base::Hardware::Ready();
+	DebugInfo dbg{};
+	// Publish the finished DebugInfo under the lock GetDebug() uses. Every
+	// path out of Tick(), including the early returns below, publishes once
+	// through this destructor; unlocked writes raced the reader.
+	struct PublishDebug {
+		DebugInfo& info;
+		~PublishDebug() {
+			std::lock_guard<std::mutex> lock(g_debugMutex);
+			g_debug = info;
+		}
+	} publishDebug{ dbg };
+    dbg.enabled = cfg.Enabled;
+    dbg.menuOpen = Overlay::MenuOpen();
+    dbg.aimType = cfg.AimType;
+    dbg.deviceReady = Base::Hardware::Ready();
 
     const auto stopAiming = [] {
         if (g_wasAiming) {
@@ -834,21 +860,21 @@ void Tick()
     };
 
     if (!cfg.Enabled) {
-        g_debug.reason = "aim disabled";
+        dbg.reason = "aim disabled";
         stopAiming();
         resetSmoothing();
         g_lastTarget = -1;
         return;
     }
     if (ConfigInstance.Overlay.PanicMode) {
-        g_debug.reason = "panic active";
+        dbg.reason = "panic active";
         stopAiming();
         resetSmoothing();
         g_lastTarget = -1;
         return;
     }
     if (Overlay::MenuOpen()) {
-        g_debug.reason = "menu open";
+        dbg.reason = "menu open";
         stopAiming();
         resetSmoothing();
         g_lastTarget = -1;
@@ -856,10 +882,10 @@ void Tick()
     }
 
     const char* keySource = "-";
-    g_debug.held = Held(cfg.AimKey, &keySource);
-    g_debug.keySource = keySource;
-    if (!g_debug.held) {
-        g_debug.reason = "aim key not held";
+    dbg.held = Held(cfg.AimKey, &keySource);
+    dbg.keySource = keySource;
+    if (!dbg.held) {
+        dbg.reason = "aim key not held";
         stopAiming();
         resetSmoothing();
         g_lastTarget = -1;
@@ -869,11 +895,11 @@ void Tick()
 
     const auto snapshot = RobRunReader::GetSnapshot();
     if (!snapshot || snapshot->entities.empty()) {
-        g_debug.reason = "no entities";
+        dbg.reason = "no entities";
         stopAiming();
         return;
     }
-    g_debug.entities = static_cast<int>(snapshot->entities.size());
+    dbg.entities = static_cast<int>(snapshot->entities.size());
 
     // A scene/session change (level transition, new match) invalidates every
     // pointer the aim was holding. Reset smoothing and block memory writes
@@ -896,16 +922,23 @@ void Tick()
     const int width = static_cast<int>(dispX);
     const int height = static_cast<int>(dispY);
     if (width <= 0 || height <= 0) {
-        g_debug.reason = "no display size";
+        dbg.reason = "no display size";
         return;
     }
 
     Matrix4x4 viewProjection{};
     if (!RobRunReader::ResolveViewProjection(viewProjection, width, height)) {
-        g_debug.reason = "no view projection";
+        dbg.reason = "no view projection";
         stopAiming();
         return;
     }
+
+    // Solve angles from the same camera the projection above was built with.
+    // snapshot->camera trails the render thread by up to one worker cycle, so
+    // using it here biased yaw/pitch by the camera's motion since the snapshot.
+    RobRunCamera::CameraState freshCamera{};
+    const bool haveFreshCamera = RobRunReader::GetFreshCamera(freshCamera) &&
+        freshCamera.valid;
 
     const float centerX = dispX * 0.5f;
     const float centerY = dispY * 0.5f;
@@ -914,8 +947,9 @@ void Tick()
     // The previous angular dot-product gate used the worker's camera sample
     // while the projection used the fresher render-thread camera, so it could
     // reject every target while the ESP drew them on screen.
-    const float verticalFov = snapshot->camera.valid
-        ? snapshot->camera.verticalFov : 60.f;
+    const float verticalFov = haveFreshCamera
+        ? freshCamera.verticalFov
+        : (snapshot->camera.valid ? snapshot->camera.verticalFov : 60.f);
     const float radiusPixels = ConeRadiusPixels(viewProjection, fovDeg, verticalFov, dispY);
 
     bool found = false;
@@ -1015,7 +1049,7 @@ void Tick()
         // FOV ring, mirroring the reference's locked-target behaviour.
         const bool isLocked = cfg.HardLock && ent.entityId == g_lastTarget;
         if (!isLocked && distance > radiusPixels) continue;
-        ++g_debug.candidates;
+        ++dbg.candidates;
 
         if (isLocked) {
             found = true;
@@ -1047,7 +1081,7 @@ void Tick()
     }
 
     if (!found) {
-        g_debug.reason = "no target in FOV";
+        dbg.reason = "no target in FOV";
         stopAiming();
         resetSmoothing();
         g_lastTarget = -1;
@@ -1064,24 +1098,25 @@ void Tick()
     if (bestId != g_lastTarget)
         g_lastTargetSwitchMs = nowMs;
     g_lastTarget = bestId;
-    g_debug.target = bestId;
-    g_debug.leadMs = bestLeadMs;
+    dbg.target = bestId;
+    dbg.leadMs = bestLeadMs;
 
     const float dx = bestScreen.x - centerX;
     const float dy = bestScreen.y - centerY;
-    g_debug.dx = dx;
-    g_debug.dy = dy;
+    dbg.dx = dx;
+    dbg.dy = dy;
 
     // Target angles are measured from the camera, not the local player: the
     // camera is what actually has to turn.
-    const Vector3 origin = snapshot->camera.valid
-        ? snapshot->camera.position : snapshot->localPosition;
+    const Vector3 origin = haveFreshCamera
+        ? freshCamera.position
+        : (snapshot->camera.valid ? snapshot->camera.position : snapshot->localPosition);
     if (origin.IsZero()) {
-        g_debug.reason = "no camera origin";
+        dbg.reason = "no camera origin";
         stopAiming();
         return;
     }
-    g_debug.distance = Distance(origin, bestPoint);
+    dbg.distance = Distance(origin, bestPoint);
 
     const Vector3 dir = Vector3(
         bestPoint.x - origin.x,
@@ -1089,7 +1124,7 @@ void Tick()
         bestPoint.z - origin.z);
     const float length = std::sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
     if (length < 1.0e-4f) {
-        g_debug.reason = "zero aim vector";
+        dbg.reason = "zero aim vector";
         return;
     }
     const float horizontal = std::hypot(dir.x, dir.z);
@@ -1099,7 +1134,7 @@ void Tick()
     // -------- Memory Aim: write camera angles over DMA -------------------
     if (cfg.AimType == 0 && cfg.MemoryWrite) {
         stopAiming();
-        g_debug.writeMode = true;
+        dbg.writeMode = true;
 
         const std::uintptr_t cameraModel = snapshot->cameraModel;
         const std::uintptr_t battleModel = snapshot->battleModel;
@@ -1159,8 +1194,8 @@ void Tick()
                 g_curPitch, outcome, &liveForward,
                 snapshot->lookDirectionModel, snapshot->lookDirDirect,
                 snapshot->playerRotationInput);
-            g_debug.tgtYawDeg = g_curYaw * 180.f / kPi;
-            g_debug.tgtPitchDeg = g_curPitch * 180.f / kPi;
+            dbg.tgtYawDeg = g_curYaw * 180.f / kPi;
+            dbg.tgtPitchDeg = g_curPitch * 180.f / kPi;
 
             // Verdict on the previous write using the forward the scatter
             // validation read fetched (before the new write replaced it).
@@ -1177,23 +1212,23 @@ void Tick()
             }
         }
 
-        g_debug.writeOk = g_writeHealthy;
-        g_debug.writeState = g_lastVerdict;
+        dbg.writeOk = g_writeHealthy;
+        dbg.writeState = g_lastVerdict;
 
         if (g_writeHealthy) {
-            g_debug.reason = "writing angles (memory)";
+            dbg.reason = "writing angles (memory)";
             return;
         }
 
         if (!cfg.CursorFallback) {
-            g_debug.reason = "memory write unavailable";
+            dbg.reason = "memory write unavailable";
             return;
         }
         // Fall through to the cursor path below.
     }
 
     if (std::hypot(dx, dy) < 0.5f) {
-        g_debug.reason = "on target";
+        dbg.reason = "on target";
         return;
     }
 
@@ -1216,13 +1251,13 @@ void Tick()
         const auto step = Base::AimMotion::Step({ dx, dy }, settings, dt);
         const int mx = static_cast<int>(std::lround(step.x));
         const int my = static_cast<int>(std::lround(step.y));
-        g_debug.stepX = mx;
-        g_debug.stepY = my;
+        dbg.stepX = mx;
+        dbg.stepY = my;
         if (mx != 0 || my != 0) {
             SendRelative(mx, my);
-            g_debug.reason = "moving (cursor)";
+            dbg.reason = "moving (cursor)";
         } else {
-            g_debug.reason = "inside deadzone";
+            dbg.reason = "inside deadzone";
         }
         return;
     }
@@ -1235,7 +1270,7 @@ void Tick()
     // not necessarily one screen pixel) and the higher cap lets flicks reach
     // the device's 127-count report limit instead of being clamped early.
     if (!Base::Hardware::Ready()) {
-        g_debug.reason = "hardware device not ready";
+        dbg.reason = "hardware device not ready";
         stopAiming();
         return;
     }
@@ -1255,19 +1290,27 @@ void Tick()
     intent.expires = Base::Hardware::Clock::now() + std::chrono::milliseconds(50);
     if (Base::Hardware::Session().Submit(Base::Hardware::Source::Aim, intent)) {
         g_wasAiming = true;
-        g_debug.reason = "moving (hardware)";
+        dbg.reason = "moving (hardware)";
     } else {
-        g_debug.reason = "hardware submit rejected";
+        dbg.reason = "hardware submit rejected";
     }
 }
 
 static std::uintptr_t g_cachedPlayerClient = 0;
 static std::uint64_t g_lastRecoilGen = 0;
+static float    g_lastPitch = 0.f;
+static bool     g_pitchValid = false;
+static int      g_lastShotIndex = -1;
+static float    g_kickBudget = 0.f;
+static constexpr float kKickBudgetPerShot = 0.0175f; // ~1 degree
 
 void TickRecoilSpread()
 {
     const auto& cfg = ConfigInstance.Aim;
-    if (!cfg.NoRecoil && !cfg.NoSpread && !cfg.DynamicRecoilCompensation) return;
+    if (!cfg.NoRecoil && !cfg.NoSpread && !cfg.DynamicRecoilCompensation) {
+        g_pitchValid = false;
+        return;
+    }
 
     const auto snapshot = RobRunReader::GetSnapshot();
     if (!snapshot || snapshot->battleModel <= 0x10000) return;
@@ -1275,9 +1318,16 @@ void TickRecoilSpread()
     if (snapshot->sessionGeneration != g_lastRecoilGen) {
         g_cachedPlayerClient = 0;
         g_lastRecoilGen = snapshot->sessionGeneration;
+        g_pitchValid = false;
+        g_lastShotIndex = -1;
+        g_kickBudget = 0.f;
     }
 
-    if (g_cachedPlayerClient <= 0x10000) {
+    // Revalidate client pointer every 500ms (respawn can free old one)
+    static std::uint64_t g_lastClientCheck = 0;
+    const std::uint64_t now = GetTickCount64();
+    if (g_cachedPlayerClient <= 0x10000 || now - g_lastClientCheck > 500) {
+        g_lastClientCheck = now;
         const std::uintptr_t battleEnts = RobRunMemory::ReadPtr(
             snapshot->battleModel + rr::BattleModel::BattleEntitiesModel);
         if (battleEnts <= 0x10000) return;
@@ -1289,48 +1339,87 @@ void TickRecoilSpread()
         if (g_cachedPlayerClient <= 0x10000) return;
     }
 
-    Memory::ScopedScatter scatter(TargetProcess);
-    if (!scatter.handle) return;
-
-    struct { float x, y, z; } zero3 = {0.f, 0.f, 0.f};
-
+    // --- No Recoil: cancel pitch kick via PlayerRotationInput ---
     if (cfg.NoRecoil) {
-        const std::uintptr_t recoilModel = RobRunMemory::ReadPtr(
-            g_cachedPlayerClient + rr::PlayerClient::Recoil);
-        if (recoilModel > 0x10000)
-            TargetProcess.AddScatterWriteRequest(scatter,
-                recoilModel + rr::RecoilModel::OffsetVec, &zero3, sizeof(zero3));
-    } else if (cfg.DynamicRecoilCompensation) {
+        const std::uintptr_t rotInput = snapshot->playerRotationInput;
+        if (rotInput > 0x10000) {
+            const std::uintptr_t fireModel = RobRunMemory::ReadPtr(
+                g_cachedPlayerClient + rr::CharacterClientModel::FireModel);
+            if (fireModel > 0x10000) {
+                struct { std::uint8_t isFiring; std::uint8_t hasShot; std::uint8_t pad[2]; std::int32_t shotIndex; } fire{};
+                RobRunMemory::ReadBytes(fireModel + rr::CharacterFireModel::IsFiring, &fire, sizeof(fire));
+
+                float pitch = 0.f;
+                RobRunMemory::ReadBytes(rotInput + rr::PlayerRotationInputModel::Pitch, &pitch, sizeof(pitch));
+
+                if (std::isfinite(pitch) && std::fabs(pitch) < 1.75f) {
+                    if (!g_pitchValid) {
+                        g_lastPitch = pitch;
+                        g_lastShotIndex = fire.shotIndex;
+                        g_pitchValid = true;
+                    } else {
+                        if (fire.shotIndex != g_lastShotIndex) {
+                            g_kickBudget += kKickBudgetPerShot;
+                            g_lastShotIndex = fire.shotIndex;
+                        }
+                        if (fire.isFiring) {
+                            const float delta = pitch - g_lastPitch;
+                            if (delta < -1e-5f && g_kickBudget > 0.f) {
+                                float correction = -delta;
+                                if (correction > g_kickBudget) correction = g_kickBudget;
+                                g_kickBudget -= correction;
+                                const float newPitch = pitch + correction;
+                                TargetProcess.Write(rotInput + rr::PlayerRotationInputModel::Pitch,
+                                    newPitch);
+                                g_lastPitch = newPitch;
+                            } else {
+                                g_lastPitch = pitch;
+                            }
+                        } else {
+                            g_lastPitch = pitch;
+                            g_kickBudget = 0.f;
+                        }
+                    }
+                } else {
+                    g_pitchValid = false;
+                }
+            }
+        }
+    }
+    // --- Dynamic Recoil: scale RecoilOffset (Vector2, 8 bytes) ---
+    else if (cfg.DynamicRecoilCompensation) {
         const std::uintptr_t recoilModel = RobRunMemory::ReadPtr(
             g_cachedPlayerClient + rr::PlayerClient::Recoil);
         if (recoilModel > 0x10000) {
-            Vector3 curOffset{};
-            if (RobRunMemory::ReadVector3(recoilModel + rr::RecoilModel::OffsetVec, curOffset)) {
+            struct { float x, y; } cur{};
+            if (RobRunMemory::ReadBytes(recoilModel + rr::RecoilModel::OffsetVec, &cur, sizeof(cur))) {
                 const float factor = std::clamp(1.f - cfg.RecoilStrength, 0.f, 1.f);
-                curOffset.x *= factor;
-                curOffset.y *= factor;
-                curOffset.z *= factor;
-                TargetProcess.AddScatterWriteRequest(scatter,
-                    recoilModel + rr::RecoilModel::OffsetVec, &curOffset, sizeof(curOffset));
+                cur.x *= factor;
+                cur.y *= factor;
+                TargetProcess.Write(recoilModel + rr::RecoilModel::OffsetVec,
+                    reinterpret_cast<void*>(&cur), sizeof(cur));
             }
         }
     }
 
+    // --- No Spread: zero per-frame outputs (limited effectiveness) ---
     if (cfg.NoSpread) {
-        const std::uintptr_t spreadModel = RobRunMemory::ReadPtr(
-            g_cachedPlayerClient + rr::PlayerClient::FakeSpread);
-        if (spreadModel > 0x10000) {
-            float zero = 0.f;
-            TargetProcess.AddScatterWriteRequest(scatter,
-                spreadModel + rr::FakeSpreadModel::Spread, &zero, sizeof(zero));
-            TargetProcess.AddScatterWriteRequest(scatter,
-                spreadModel + rr::FakeSpreadModel::Air, &zero, sizeof(zero));
-            TargetProcess.AddScatterWriteRequest(scatter,
-                spreadModel + rr::FakeSpreadModel::Move, &zero, sizeof(zero));
+        Memory::ScopedScatter scatter(TargetProcess);
+        if (scatter.handle) {
+            const std::uintptr_t spreadModel = RobRunMemory::ReadPtr(
+                g_cachedPlayerClient + rr::PlayerClient::FakeSpread);
+            if (spreadModel > 0x10000) {
+                float zero = 0.f;
+                TargetProcess.AddScatterWriteRequest(scatter,
+                    spreadModel + rr::FakeSpreadModel::Spread, &zero, sizeof(zero));
+                TargetProcess.AddScatterWriteRequest(scatter,
+                    spreadModel + rr::FakeSpreadModel::Air, &zero, sizeof(zero));
+                TargetProcess.AddScatterWriteRequest(scatter,
+                    spreadModel + rr::FakeSpreadModel::Move, &zero, sizeof(zero));
+            }
+            TargetProcess.ExecuteScatterWrite(scatter);
         }
     }
-
-    if (!TargetProcess.ExecuteScatterWrite(scatter)) return;
 }
 
 void Draw()
@@ -1342,8 +1431,13 @@ void Draw()
     if (display.x <= 0.f || display.y <= 0.f) return;
 
     float verticalFov = 60.f;
-    const auto snapshot = RobRunReader::GetSnapshot();
-    if (snapshot && snapshot->camera.valid) verticalFov = snapshot->camera.verticalFov;
+    RobRunCamera::CameraState freshCamera{};
+    if (RobRunReader::GetFreshCamera(freshCamera) && freshCamera.valid)
+        verticalFov = freshCamera.verticalFov;
+    else {
+        const auto snapshot = RobRunReader::GetSnapshot();
+        if (snapshot && snapshot->camera.valid) verticalFov = snapshot->camera.verticalFov;
+    }
 
     Matrix4x4 viewProjection{};
     float radius;

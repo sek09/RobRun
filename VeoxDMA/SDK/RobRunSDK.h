@@ -16,8 +16,8 @@
 namespace rr {
 
 inline constexpr const char* kBuild = "26549963";
-inline constexpr std::uint32_t kPeTimestamp = 0x6AF2C76Fu;
-inline constexpr std::uint32_t kPeSizeOfImage = 0x08FF3000u;
+inline constexpr std::uint32_t kPeTimestamp = 0x6B00114Du;
+inline constexpr std::uint32_t kPeSizeOfImage = 0x0904F000u;
 inline constexpr const char* kGameAssemblySha256 =
     "ecd0a4275325fce38c9794576c541891cb8dfaa0b0ac3a38fdd2dc9711ecb81e";
 inline constexpr std::uint32_t kUnityPlayerPeTimestamp = 0x6A28669Fu;
@@ -133,7 +133,7 @@ inline constexpr std::int32_t entry_allocated_min = -1;
 // ------------------------------------------------------------------
 namespace Game {
 inline constexpr std::uintptr_t ActiveUpdaters = 0x20; // List<reference>
-inline constexpr std::uintptr_t GameModel      = 0xD0;
+inline constexpr std::uintptr_t GameModel      = 0xD8;
 }
 
 namespace GameModel {
@@ -249,10 +249,13 @@ inline constexpr std::uintptr_t HasArmor                = 0x1B8;
 inline constexpr std::uintptr_t InVehicle               = 0x1C8;
 inline constexpr std::uintptr_t State                   = 0x1E0;
 inline constexpr std::uintptr_t PlayerRole              = 0x208;
+inline constexpr std::uintptr_t ChangeRoleTickIndex     = 0x218;
 inline constexpr std::uintptr_t Pbm                     = 0x258;
+inline constexpr std::uintptr_t BecomeRobberModel       = 0x260;
 inline constexpr std::uintptr_t CenterPosition          = 0x290;
 inline constexpr std::uintptr_t Revival                 = 0x2A0;
 inline constexpr std::uintptr_t Knockdown               = 0x2D0;
+inline constexpr std::uintptr_t KnockdownLeaveState     = 0x2D8;
 inline constexpr std::uintptr_t CapsuleColliderParams   = 0x318;
 }
 
@@ -314,6 +317,15 @@ namespace ReferenceData {
 inline constexpr std::uintptr_t Value = 0x18;
 }
 
+namespace BecomeRobberModel {
+inline constexpr std::uintptr_t _ts                       = 0x10; // IPrimitiveData<long>
+inline constexpr std::uintptr_t _mutuallyExclusiveProcess = 0x18;
+}
+
+namespace ChangeRoleTickIndexModel {
+inline constexpr std::uintptr_t Value                     = 0x10; // long
+}
+
 namespace Description {
 inline constexpr std::uintptr_t Name = 0x10;
 }
@@ -351,8 +363,19 @@ inline constexpr std::uintptr_t Correction = 0x28;
 inline constexpr std::uintptr_t BlockTimer = 0x34;
 }
 
+namespace CharacterClientModel {
+inline constexpr std::uintptr_t FireModel = 0xB8;
+}
+
+namespace CharacterFireModel {
+inline constexpr std::uintptr_t IsFiring   = 0x10;
+inline constexpr std::uintptr_t HasShot    = 0x11;
+inline constexpr std::uintptr_t ShotIndex  = 0x14;
+inline constexpr std::uintptr_t ShotTime   = 0x18;
+}
+
 namespace RecoilModel {
-inline constexpr std::uintptr_t OffsetVec = 0x10;
+inline constexpr std::uintptr_t OffsetVec = 0x10; // Vector2 (8 bytes)
 }
 
 namespace FakeSpreadModel {
@@ -822,7 +845,12 @@ namespace StaticLootObjectModel {
 inline constexpr std::uintptr_t Description = 0x18; // V3 position at +0x30
 }
 
+namespace StaticLootObjectDescription {
+inline constexpr std::uintptr_t LootItemFunc = 0x28; // Func<LootObjectItemDescription> delegate
+}
+
 namespace RandomLootObjectModel {
+inline constexpr std::uintptr_t Item        = 0x18; // IPrimitiveData<LootObjectItemDescription>
 inline constexpr std::uintptr_t Description = 0x20; // V3 position at +0x24
 }
 
@@ -937,11 +965,14 @@ inline constexpr std::uintptr_t Value               = 0x18; // int32
 namespace DroppedBagModel {
 inline constexpr std::uintptr_t Transform        = 0x20;
 inline constexpr std::uintptr_t InteractPosition = 0x28;
+inline constexpr std::uintptr_t BagDescription   = 0x30; // IPrimitiveModel<CharacterBagDescription>
+inline constexpr std::uintptr_t Role             = 0x38; // IPrimitiveModel<PlayerRoleDescription>
 }
 
 namespace VehicleLootModel {
 inline constexpr std::uintptr_t Transform        = 0x20;
 inline constexpr std::uintptr_t InteractPosition = 0x28;
+inline constexpr std::uintptr_t HasCargo         = 0x38; // IPrimitiveModel<bool>
 }
 
 namespace CargoModel {
@@ -973,6 +1004,10 @@ inline constexpr std::uintptr_t EndTs = 0x18; // TimestampData (+0x18 i64)
 namespace KnockdownModel {
 inline constexpr std::uintptr_t EndTs           = 0x10; // TimestampData (+0x18 i64)
 inline constexpr std::uintptr_t IsKnockedForward = 0x18; // BoolData (+0x18 u8)
+}
+
+namespace KnockdownLeaveStateModel {
+inline constexpr std::uintptr_t IsActive = 0x10; // bool (plain stored field)
 }
 
 namespace CoinsByDataModel {
@@ -1212,9 +1247,12 @@ inline constexpr std::uintptr_t BattleEntitiesModel        = 0x81C2048;
 inline constexpr std::uintptr_t BattleEntitiesUpdater      = 0x81C2510;
 inline constexpr std::uintptr_t BattleCharacterEntityModel = 0x81BB720;
 inline constexpr std::uintptr_t PlayerEntityModel          = 0x81F8398;
-inline constexpr std::uintptr_t BattleCameraModel          = 0x81B8DB8;
+inline constexpr std::uintptr_t BattleCameraModel          = 0x823C210;
 inline constexpr std::uintptr_t ClientCharacterSlotsModel  = 0x816E270;
 inline constexpr std::uintptr_t GlobalModel                = 0x813B310;
+inline constexpr std::uintptr_t WorldEntitiesModel         = 0x82295C8;
+inline constexpr std::uintptr_t BattleCharacterModel       = 0x823FFD0;
+inline constexpr std::uintptr_t GameModels                 = 0x81B8870;
 inline constexpr std::uintptr_t BlindedEffect              = 0x81DC358; // new offset set
 }
 

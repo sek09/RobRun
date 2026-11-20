@@ -194,7 +194,7 @@ static void DrawPlayerChams(ImDrawList* dl, const RobRunReader::EntityData& ent,
 		}
 	}
 	if (g_charMesh.valid && ent.boneWorldMatrices.size() >= 2) {
-		static std::vector<Vector3> skinned;
+		thread_local std::vector<Vector3> skinned;
 		static bool loggedOnce = false;
 		if (!loggedOnce) {
 			DLOG("PlayerEsp: mesh chams path entered, boneWorldMatrices.size=%zu, boneMap.size=%zu",
@@ -538,7 +538,17 @@ void DrawPlayers()
 	// projects exactly the points it is given. There is no render-thread
 	// interpolation or extrapolation: extrapolating past the newest sample was
 	// what made bones overshoot and spring back every frame.
-	std::vector<std::string> lookingNames;
+	thread_local std::vector<std::string> lookingNames;
+	lookingNames.clear();
+
+	// Text segments are rebuilt every frame for every player. Keep the buffers
+	// (and the joined-line scratch) alive across frames instead of allocating
+	// them per entity per frame.
+	struct TextSeg { std::string text; ImU32 col; };
+	thread_local std::vector<TextSeg> topSegs;
+	thread_local std::vector<TextSeg> stateSegs;
+	thread_local std::vector<TextSeg> lookSeg;
+	thread_local std::string segFull;
 
 	for (const auto& ent : snapshot->entities)
 	{
@@ -584,6 +594,70 @@ void DrawPlayers()
 			continue;
 		}
 
+		// Attenuate colors by HiddenAlpha when entity is occluded (item 5)
+		const float alphaMult = ent.visible ? 1.0f : std::clamp(pcfg.HiddenAlpha, 0.05f, 0.60f);
+		const ImU32 boxCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.BoxColour), alphaMult);
+		const ImU32 nameCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.NameColour), alphaMult);
+		const ImU32 distCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.DistanceColour), alphaMult);
+		const ImU32 hpTxtCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HealthTextColour), alphaMult);
+		const ImU32 weapCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.WeaponColour), alphaMult);
+		const ImU32 roleCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.RoleColour), alphaMult);
+		const ImU32 lookCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.LookingColour), alphaMult);
+		const ImU32 stateCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.StateColour), alphaMult);
+		const ImU32 espCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.TextColour), alphaMult);
+
+		// Vis Ring: 3D Ground Circle on floor (Y + 0.05m) (item 8)
+		if (pcfg.VisRing)
+		{
+			constexpr int kRingSegments = 24;
+			constexpr float kRingRadius = 0.50f;
+			const Vector3 groundCenter(entPos.x, entPos.y + 0.05f, entPos.z);
+			ImVec2 rpts[kRingSegments];
+			bool rvalid[kRingSegments];
+			int numValid = 0;
+			for (int i = 0; i < kRingSegments; ++i) {
+				const float angle = (float)i * (6.2831853f / (float)kRingSegments);
+				const Vector3 p(groundCenter.x + std::cos(angle) * kRingRadius, groundCenter.y, groundCenter.z + std::sin(angle) * kRingRadius);
+				rvalid[i] = Project(viewProjection, p, screenW, screenH, rpts[i]);
+				if (rvalid[i]) ++numValid;
+			}
+			if (numValid >= 12) {
+				const float pulse = 0.65f + 0.35f * std::sin((float)ImGui::GetTime() * 8.f);
+				ImU32 ringCol;
+				if (ent.visible) {
+					ringCol = IM_COL32(
+						(int)(pcfg.VisRingColour.r * 255.f),
+						(int)(pcfg.VisRingColour.g * 255.f),
+						(int)(pcfg.VisRingColour.b * 255.f),
+						(int)(255.f * pulse));
+				} else {
+					ringCol = IM_COL32(130, 130, 130, (int)(80.f * alphaMult));
+				}
+				for (int i = 0; i < kRingSegments; ++i) {
+					int next = (i + 1) % kRingSegments;
+					if (rvalid[i] && rvalid[next]) {
+						dl->AddLine(rpts[i], rpts[next], ringCol, ent.visible ? 2.0f : 1.0f);
+					}
+				}
+			}
+		}
+
+		// Status Ring: Subtle screen-space halo around torso/head centroid when visible (item 8)
+		if (pcfg.StatusRing && ent.visible)
+		{
+			const Vector3 centroid = ent.bonePoints.hasChest ? ent.bonePoints.chest : Vector3(entPos.x, entPos.y + 1.25f, entPos.z);
+			ImVec2 screenCentroid;
+			if (Project(viewProjection, centroid, screenW, screenH, screenCentroid)) {
+				const float pulse = 0.70f + 0.30f * std::sin((float)ImGui::GetTime() * 10.f);
+				const ImU32 statusCol = IM_COL32(
+					(int)(pcfg.StatusRingColour.r * 255.f),
+					(int)(pcfg.StatusRingColour.g * 255.f),
+					(int)(pcfg.StatusRingColour.b * 255.f),
+					(int)(230.f * pulse));
+				dl->AddCircle(screenCentroid, 18.f, statusCol, 0, 1.8f);
+			}
+		}
+
 		// --- chams ---
 		if (pcfg.Chams)
 		{
@@ -609,7 +683,7 @@ void DrawPlayers()
 				if (pcfg.VisCheck || pcfg.WallCheck) {
 					segCol = seg.visible
 						? Esp::D2DColorToImU32(pcfg.VisibleColour)
-						: Esp::D2DColorToImU32(pcfg.HiddenColour);
+						: Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HiddenColour), alphaMult);
 				}
 				dl->AddLine(a, b, segCol, pcfg.SkeletonThickness);
 			}
@@ -641,7 +715,7 @@ void DrawPlayers()
 				if (pcfg.VisCheck || pcfg.WallCheck) {
 					headCol = ent.visible
 						? Esp::D2DColorToImU32(pcfg.VisibleColour)
-						: Esp::D2DColorToImU32(pcfg.HiddenColour);
+						: Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HiddenColour), alphaMult);
 				}
 				dl->AddCircle(sc, sr, headCol, 0, 2.f);
 			}
@@ -674,7 +748,7 @@ void DrawPlayers()
 			if (pcfg.VisCheck || pcfg.WallCheck) {
 				currentBoxCol = ent.visible
 					? Esp::D2DColorToImU32(pcfg.VisibleColour)
-					: Esp::D2DColorToImU32(pcfg.HiddenColour);
+					: Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HiddenColour), alphaMult);
 			}
 			Esp::DrawCornerBox(dl, ImVec2(minX - 4.f, minY - 4.f),
 				ImVec2(maxX + 4.f, maxY + 4.f), currentBoxCol, 1.5f, 25.f, true);
@@ -713,11 +787,11 @@ void DrawPlayers()
 				? ImVec2((minX + maxX) * 0.5f, maxY + 4.f)
 				: screenPos;
 
-			ImU32 snapCol = Esp::D2DColorToImU32(pcfg.SnaplineColour);
+			ImU32 snapCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.SnaplineColour), alphaMult);
 			if (pcfg.VisCheck || pcfg.WallCheck) {
 				snapCol = ent.visible
 					? Esp::D2DColorToImU32(pcfg.VisibleColour)
-					: Esp::D2DColorToImU32(pcfg.HiddenColour);
+					: Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HiddenColour), alphaMult);
 			}
 			dl->AddLine(origin, snapTarget, snapCol, 1.2f);
 		}
@@ -732,11 +806,11 @@ void DrawPlayers()
 			ImVec2 headScreen{};
 			if (Project(viewProjection, headPos, screenW, screenH, headScreen))
 			{
-				ImU32 headCol = Esp::D2DColorToImU32(pcfg.HeadDotColour);
+				ImU32 headCol = Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HeadDotColour), alphaMult);
 				if (pcfg.VisCheck || pcfg.WallCheck) {
 					headCol = ent.visible
 						? Esp::D2DColorToImU32(pcfg.VisibleColour)
-						: Esp::D2DColorToImU32(pcfg.HiddenColour);
+						: Esp::ScaleAlpha(Esp::D2DColorToImU32(pcfg.HiddenColour), alphaMult);
 				}
 				dl->AddCircleFilled(headScreen, pcfg.HeadDotRadius, headCol);
 				dl->AddCircle(headScreen, pcfg.HeadDotRadius, IM_COL32(0, 0, 0, 180), 0, 1.0f);
@@ -744,7 +818,6 @@ void DrawPlayers()
 		}
 
 		// --- colored text segments ---
-		struct TextSeg { std::string text; ImU32 col; };
 
 		// Pulse multiplier for active state indicators (0.5..1.0 alpha cycle)
 		const float pulse = 0.6f + 0.4f * std::sin((float)ImGui::GetTime() * 8.f);
@@ -764,10 +837,10 @@ void DrawPlayers()
 			: screenPos.x;
 
 		auto drawSegLine = [&](const std::vector<TextSeg>& segs, float y) {
-			std::string full;
-			for (const auto& s : segs) full += s.text;
-			if (full.empty()) return y;
-			ImVec2 fullSize = MeasureText(full.c_str(), fontSize);
+			segFull.clear();
+			for (const auto& s : segs) segFull += s.text;
+			if (segFull.empty()) return y;
+			ImVec2 fullSize = MeasureText(segFull.c_str(), fontSize);
 			float cx = textX - fullSize.x * 0.5f;
 			for (const auto& s : segs) {
 				ImVec2 sz = MeasureText(s.text.c_str(), fontSize);
@@ -777,18 +850,35 @@ void DrawPlayers()
 			return y + fullSize.y;
 		};
 
+		// Resolve role color once — used for name and role tag
+		const std::string roleLabel =
+			RobRunReader::RoleLabel(ent.role, ent.roleName);
+		ImU32 roleBasedCol = nameCol;
+		if (pcfg.NameByRole && !roleLabel.empty()) {
+			if (roleLabel == "Criminal")
+				roleBasedCol = Esp::D2DColorToImU32(pcfg.CriminalColour);
+			else if (roleLabel == "Police Officer")
+				roleBasedCol = Esp::D2DColorToImU32(pcfg.PoliceColour);
+			else if (roleLabel == "Civilian")
+				roleBasedCol = Esp::D2DColorToImU32(pcfg.CivilianColour);
+			else if (roleLabel == "Hubber")
+				roleBasedCol = Esp::D2DColorToImU32(pcfg.HubberColour);
+			if (alphaMult < 1.f)
+				roleBasedCol = Esp::ScaleAlpha(roleBasedCol, alphaMult);
+		}
+
 		// Top: name + clan tag
-		std::vector<TextSeg> topSegs;
-		if (!ent.nickname.empty())
-			topSegs.push_back({ RobRunMemory::WideToUtf8(ent.nickname), nameCol });
-		if (!ent.clanTag.empty())
-			topSegs.push_back({ " <" + RobRunMemory::WideToUtf8(ent.clanTag) + ">", nameCol });
+		topSegs.clear();
+		if (!ent.nicknameUtf8.empty())
+			topSegs.push_back({ ent.nicknameUtf8, roleBasedCol });
+		if (!ent.clanTagUtf8.empty())
+			topSegs.push_back({ " <" + ent.clanTagUtf8 + ">", roleBasedCol });
 
 		float topY = boxValid ? (minY - 6.f) : screenPos.y;
 		if (!topSegs.empty()) {
-			std::string full;
-			for (const auto& s : topSegs) full += s.text;
-			ImVec2 sz = MeasureText(full.c_str(), fontSize);
+			segFull.clear();
+			for (const auto& s : topSegs) segFull += s.text;
+			ImVec2 sz = MeasureText(segFull.c_str(), fontSize);
 			topY -= sz.y;
 			drawSegLine(topSegs, topY);
 		}
@@ -796,9 +886,7 @@ void DrawPlayers()
 		// Bottom: weapon sprite + weapon name + distance
 		float botY = boxValid ? (maxY + 8.f) : (screenPos.y + 14.f);
 		{
-			const std::string weapStr = ent.weaponName.empty()
-				? std::string()
-				: RobRunMemory::WideToUtf8(ent.weaponName);
+			const std::string& weapStr = ent.weaponNameUtf8;
 			char distBuf[32]{};
 			if (pcfg.Distance)
 				snprintf(distBuf, sizeof(distBuf), "%.1f m", distF);
@@ -850,7 +938,7 @@ void DrawPlayers()
 		}
 
 		// State indicators line
-		std::vector<TextSeg> stateSegs;
+		stateSegs.clear();
 		if (pcfg.VisCheck || pcfg.WallCheck)
 		{
 			const ImU32 visBadgeCol = ent.visible
@@ -888,21 +976,27 @@ void DrawPlayers()
 		if (pcfg.ShowRole)
 		{
 			ImU32 roleTextCol = roleCol;
-			const std::string roleLabel =
-				RobRunReader::RoleLabel(ent.role, ent.roleName);
-			if (pcfg.ExpRoleColors && !roleLabel.empty())
-			{
+			if (pcfg.ExpRoleColors && !roleLabel.empty()) {
 				if (roleLabel == "Criminal")
-					roleTextCol = IM_COL32(255, 85, 85, 255);
+					roleTextCol = Esp::D2DColorToImU32(pcfg.CriminalColour);
 				else if (roleLabel == "Police Officer")
-					roleTextCol = IM_COL32(80, 175, 255, 255);
+					roleTextCol = Esp::D2DColorToImU32(pcfg.PoliceColour);
 				else if (roleLabel == "Civilian")
-					roleTextCol = IM_COL32(100, 235, 130, 255);
+					roleTextCol = Esp::D2DColorToImU32(pcfg.CivilianColour);
 				else if (roleLabel == "Hubber")
-					roleTextCol = IM_COL32(150, 175, 225, 255);
+					roleTextCol = Esp::D2DColorToImU32(pcfg.HubberColour);
+				if (alphaMult < 1.f)
+					roleTextCol = Esp::ScaleAlpha(roleTextCol, alphaMult);
 			}
 			if (!roleLabel.empty())
 				stateSegs.push_back({ "[" + roleLabel + "]", roleTextCol });
+		}
+		if (ent.bagValue > 0) {
+			const char* bagTag = (ent.role != 0 && ent.roleName == "Police Officer")
+				? "CBAG" : "RBAG";
+			stateSegs.push_back({ "[" + std::string(bagTag) + ":$"
+				+ std::to_string(ent.bagValue) + "]",
+				IM_COL32(120, 255, 140, 255) });
 		}
 		if (ent.inVehicle) stateSegs.push_back({ "[V]", stateCol });
 		else if (ent.isCrouching) stateSegs.push_back({ "[C]", stateCol });
@@ -928,14 +1022,15 @@ void DrawPlayers()
 				if (dot > 0.90f)
 				{
 					if (pcfg.LookingAtYou) {
-						std::vector<TextSeg> lookSeg = { { "[LOOKING]", lookCol } };
+						lookSeg.clear();
+						lookSeg.push_back({ "[LOOKING]", lookCol });
 						botY = drawSegLine(lookSeg, botY);
 					}
 					if (pcfg.LookingAlert) {
-						std::string name = ent.nickname.empty()
-							? ("Entity " + std::to_string(ent.entityId))
-							: RobRunMemory::WideToUtf8(ent.nickname);
-						lookingNames.push_back(std::move(name));
+						if (ent.nicknameUtf8.empty())
+							lookingNames.push_back("Entity " + std::to_string(ent.entityId));
+						else
+							lookingNames.push_back(ent.nicknameUtf8);
 					}
 				}
 			}

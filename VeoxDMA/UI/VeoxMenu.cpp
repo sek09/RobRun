@@ -1012,10 +1012,18 @@ void DrawVisuals()
 			EndCard();
 		}
 
-		if (MatchAny({ "Name", "Distance", "Health", "Weapon" }))
+		if (MatchAny({ "Name", "Distance", "Health", "Weapon", "Role", "Criminal", "Police", "Civilian" }))
 		{
 			BeginCard("TEXT & COLOURS", kCardW);
 			ColorRow("Name", ConfigInstance.Player.NameColour);
+			ToggleRow("Color names by role", &ConfigInstance.Player.NameByRole);
+			if (ConfigInstance.Player.NameByRole)
+			{
+				ColorRow("Criminal", ConfigInstance.Player.CriminalColour);
+				ColorRow("Police", ConfigInstance.Player.PoliceColour);
+				ColorRow("Civilian", ConfigInstance.Player.CivilianColour);
+				ColorRow("Hubber", ConfigInstance.Player.HubberColour);
+			}
 			ColorRow("Distance", ConfigInstance.Player.DistanceColour);
 			ColorRow("Health", ConfigInstance.Player.HealthTextColour);
 			ColorRow("Weapon", ConfigInstance.Player.WeaponColour);
@@ -1023,7 +1031,8 @@ void DrawVisuals()
 		}
 
 		if (MatchAny({ "Skeleton", "Draw Skeleton", "Chams", "Character Chams", "Limb Thickness",
-			"VisCheck", "WallCheck", "BVH", "Interpolate", "Lead", "Native Camera" }))
+			"VisCheck", "WallCheck", "BVH", "Interpolate", "Lead", "Native Camera",
+				"Vis Ray", "Vis Max", "Hidden Alpha", "Car Cabin", "Vis Ring", "Status Ring" }))
 		{
 			BeginCard("SKELETON & CHAMS", kCardW);
 			ToggleRow("Draw Skeleton", &ConfigInstance.Player.Skeleton);
@@ -1075,6 +1084,17 @@ void DrawVisuals()
 				if (ConfigInstance.Player.ShowBvh)
 					SliderIntRow("Draw Dist", &ConfigInstance.Player.BvhDrawDist, 10, 500, "m");
 			}
+
+			SliderIntRow("Vis Ray Count", &ConfigInstance.Player.VisRayCount, 2, 12);
+			SliderFloatRow("Vis Max Dist", &ConfigInstance.Player.VisMaxDistance, 0.f, 500.f, "m");
+			SliderFloatRow("Hidden Alpha", &ConfigInstance.Player.HiddenAlpha, 0.f, 1.f);
+			ToggleRow("Car Cabin Solid", &ConfigInstance.Player.CarCabinSolid);
+			ToggleRow("Vis Ring", &ConfigInstance.Player.VisRing);
+			if (ConfigInstance.Player.VisRing)
+				ColorRow("Vis Ring Colour", ConfigInstance.Player.VisRingColour);
+			ToggleRow("Status Ring", &ConfigInstance.Player.StatusRing);
+			if (ConfigInstance.Player.StatusRing)
+				ColorRow("Status Ring Colour", ConfigInstance.Player.StatusRingColour);
 
 			ToggleRow("Pose Smoothing", &ConfigInstance.Player.PoseSmoothing);
 			if (ConfigInstance.Player.PoseSmoothing)
@@ -1547,6 +1567,8 @@ void DrawAim()
 		ToggleRow("Skip Criminal targets", &ConfigInstance.Aim.ExpIgnoreCriminal);
 		ToggleRow("Skip Civilian targets", &ConfigInstance.Aim.ExpIgnoreCivilian);
 		ToggleRow("Skip Knocked Players", &ConfigInstance.Aim.SkipKnocked);
+		ToggleRow("Ignore Knock (Local)", &ConfigInstance.Aim.IgnoreKnock);
+		ToggleRow("Hide Default Crosshair", &ConfigInstance.Aim.HideCrosshair);
 		ToggleRow("Ignore Teammates", &ConfigInstance.Aim.ExpIgnoreTeammates);
 		if (ConfigInstance.Aim.ExpIgnoreTeammates)
 			Note("Uses party membership, not role: same-role players outside your party stay targetable.");
@@ -2160,6 +2182,13 @@ void DrawMisc()
 					world ? world->vehicles : 0, world ? world->grenades : 0);
 				Note("Skeletons %u | Aim poses %u | Pose retries %u", snapshot->skeletonCount,
 					snapshot->poseCount, snapshot->poseFailures);
+				Note("Bones %u inv %u (nZ %u nB %u pI %u) chain %u",
+					snapshot->boneTotal, snapshot->boneInvalid,
+					snapshot->boneNormZero, snapshot->boneNormBad,
+					snapshot->bonePosInf, snapshot->boneChainDrop);
+				Note("Scatter ok %u fail %u | Fresh ok %u",
+					snapshot->poseScatterOk, snapshot->poseScatterFail,
+					snapshot->poseFreshOk);
 				Note("Read failures %u", snapshot->failureCount);
 			}
 			else

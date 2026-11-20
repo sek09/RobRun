@@ -101,6 +101,12 @@ static std::unordered_map<std::uintptr_t, WeaponDescCache> g_weaponDescCache;
 static void MarkSessionChanged()
 {
     ++sessionGeneration;
+    DLOG("SessionChange: gen=%llu bm=0x%llx be=0x%llx lc=0x%llx game=0x%llx",
+         (unsigned long long)sessionGeneration,
+         (unsigned long long)cachedBattleModel,
+         (unsigned long long)cachedBattleEntities,
+         (unsigned long long)cachedLocalCharacter,
+         (unsigned long long)cachedGame);
     sessionChangedMs = GetTickCount64();
     cachedSlots.clear();
     cachedViews.clear();
@@ -171,6 +177,15 @@ static float localYaw = 0.f;
 static float localPitch = 0.f;
 static std::uint32_t failureCount = 0;
 static std::uint32_t poseFailureCount = 0;
+static std::uint32_t boneTotalAcc = 0;
+static std::uint32_t boneInvalidAcc = 0;
+static std::uint32_t boneNormZeroAcc = 0;
+static std::uint32_t boneNormBadAcc = 0;
+static std::uint32_t bonePosInfAcc = 0;
+static std::uint32_t boneChainDropAcc = 0;
+static std::uint32_t poseScatterOkAcc = 0;
+static std::uint32_t poseScatterFailAcc = 0;
+static std::uint32_t poseFreshOkAcc = 0;
 static std::atomic<bool> readCatalog{ false };
 static int updateCounter = 0;
 static int gameRetryCountdown = 0;
@@ -179,6 +194,16 @@ static int battleEntitiesRetryCountdown = 0;
 
 static Matrix4x4 fallbackViewProjection{};
 static bool fallbackViewProjectionValid = false;
+
+struct CrosshairState {
+    std::uintptr_t updater  = 0;
+    std::uintptr_t original = 0;
+    bool hidden              = false;
+};
+static CrosshairState g_crosshairState;
+
+static bool HideDefaultCrosshair(std::uintptr_t game);
+static bool RestoreDefaultCrosshair();
 
 // Slow-changing per-entity data (health, role, vehicle, identity). Reading the
 // primitive wrappers and strings costs far more than a position read, so it is
@@ -304,9 +329,58 @@ static Matrix4x4 g_nativeProjection{};
 static bool g_nativeViewProjectionValid = false;
 static float g_nativePositionError = -1.f;
 static float g_nativeForwardDot = -1.f;
+// World pose parsed from the native view matrix. Aim uses it as its angle and
+// occlusion origin so the origin and the projection come from one camera read.
+static Vector3 g_nativeCameraPosition{};
+static Vector3 g_nativeCameraForward{};
+static bool g_nativeCameraPoseValid = false;
 
 static CollisionBVH::Scene g_bvhScene;
 static std::string g_bvhLoadedPath;
+static CollisionBVH::DynamicOccluders g_dynOccluders;
+static std::mutex g_dynOccludersMutex;
+
+static void UpdateDynamicOccluders(const std::shared_ptr<const RobRunWorld::State>& world)
+{
+    if (!world) return;
+    CollisionBVH::DynamicOccluders dyn;
+    dyn.vehicles.reserve(world->entities.size());
+    dyn.smokes.reserve(world->entities.size());
+
+    for (const auto& e : world->entities) {
+        if (e.kind == RobRunWorld::Kind::Vehicle ||
+            e.kind == RobRunWorld::Kind::Car ||
+            e.kind == RobRunWorld::Kind::Helicopter)
+        {
+            CollisionBVH::VehicleOBB v;
+            v.center = { e.position.x, e.position.y + 0.95f, e.position.z };
+            v.yawRad = e.yaw * (3.14159265f / 180.0f);
+            v.isHelicopter = (e.kind == RobRunWorld::Kind::Helicopter);
+            if (v.isHelicopter) {
+                v.halfExtents = { 1.5f, 1.8f, 4.0f };
+                v.center.y = e.position.y + 1.8f;
+            } else {
+                v.halfExtents = { 1.1f, 0.95f, 2.4f };
+            }
+            dyn.vehicles.push_back(v);
+        }
+        else if (e.kind == RobRunWorld::Kind::Grenade) {
+            CollisionBVH::SmokeSphere smk;
+            smk.center = { e.position.x, e.position.y + 0.5f, e.position.z };
+            smk.radius = 4.5f;
+            dyn.smokes.push_back(smk);
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_dynOccludersMutex);
+    g_dynOccluders = std::move(dyn);
+}
+
+CollisionBVH::DynamicOccluders GetDynamicOccluders()
+{
+    std::lock_guard<std::mutex> lock(g_dynOccludersMutex);
+    return g_dynOccluders;
+}
 
 static void TryLoadBvh(bool force = false)
 {
@@ -579,6 +653,15 @@ static void PublishSnapshot()
     snapshot->playerRotationInput = cachedPlayerRotationInput;
     snapshot->failureCount = failureCount;
     snapshot->poseFailures = poseFailureCount;
+    snapshot->boneTotal = boneTotalAcc;
+    snapshot->boneInvalid = boneInvalidAcc;
+    snapshot->boneNormZero = boneNormZeroAcc;
+    snapshot->boneNormBad = boneNormBadAcc;
+    snapshot->bonePosInf = bonePosInfAcc;
+    snapshot->boneChainDrop = boneChainDropAcc;
+    snapshot->poseScatterOk = poseScatterOkAcc;
+    snapshot->poseScatterFail = poseScatterFailAcc;
+    snapshot->poseFreshOk = poseFreshOkAcc;
     snapshot->stampMs = GetTickCount64();
     snapshot->stampUs = SteadyMicros();
     snapshot->sessionGeneration = sessionGeneration;
@@ -612,12 +695,38 @@ static void PublishSnapshot()
 
 void Shutdown()
 {
+    RestoreDefaultCrosshair();
     g_workerStop.store(true, std::memory_order_relaxed);
     g_worldWorkerStop.store(true, std::memory_order_relaxed);
     if (g_workerThread.joinable())
         g_workerThread.join();
     if (g_worldWorkerThread.joinable())
         g_worldWorkerThread.join();
+
+    {
+        std::lock_guard<std::mutex> lock(g_snapshotMutex);
+        g_snapshot = std::make_shared<Snapshot>();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_worldMutex);
+        g_worldState = std::make_shared<RobRunWorld::State>();
+        g_plotState = std::make_shared<RobRunWorld::PlotState>();
+        g_inventoryState = std::make_shared<RobRunInventory::State>();
+    }
+    g_renderCameraModel.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_freshCameraMutex);
+        g_freshCamera = RobRunCamera::CameraState{};
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_nativeCameraMutex);
+        g_nativeViewProjectionValid = false;
+        g_nativeCameraPoseValid = false;
+        g_nativeCameraPosition = Vector3{};
+        g_nativeCameraForward = Vector3{};
+    }
+    gaBase = 0;
+    upBase = 0;
 }
 
 void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
@@ -718,30 +827,53 @@ void Init(std::uintptr_t gameAssemblyBase, std::uintptr_t unityPlayerBase)
     g_worldWorkerStop.store(false, std::memory_order_relaxed);
     g_worldWorkerThread = std::thread([] {
         DLOG("World worker thread started");
+        static int wwCount = 0;
         while (!g_worldWorkerStop.load(std::memory_order_relaxed)) {
-            const std::uintptr_t bm = cachedBattleModel;
-            const std::uintptr_t be = cachedBattleEntities;
-            const std::uintptr_t lc = cachedLocalCharacter;
-            if (bm > 0x10000) {
-                auto state = std::make_shared<RobRunWorld::State>();
-                if (RobRunWorld::Read(bm, be, *state)) {
-                    std::lock_guard<std::mutex> lock(g_worldMutex);
-                    g_worldState = std::move(state);
-                }
-                if (be > 0x10000) {
-                    auto plots = std::make_shared<RobRunWorld::PlotState>();
-                    if (RobRunWorld::ReadPlots(be, *plots)) {
+            try {
+                ++wwCount;
+                const std::uint64_t gen = sessionGeneration;
+                const std::uintptr_t bm = cachedBattleModel;
+                const std::uintptr_t be = cachedBattleEntities;
+                const std::uintptr_t lc = cachedLocalCharacter;
+                if (bm > 0x10000) {
+                    auto state = std::make_shared<RobRunWorld::State>();
+                    const bool worldOk = RobRunWorld::Read(bm, be, *state);
+                    if ((wwCount % 100) == 1)
+                        DLOG("WorldWorker #%d: Read=%d entities=%zu gen=%llu",
+                             wwCount, worldOk, state->entities.size(), (unsigned long long)gen);
+                    if (worldOk && sessionGeneration == gen) {
                         std::lock_guard<std::mutex> lock(g_worldMutex);
-                        g_plotState = std::move(plots);
+                        g_worldState = std::move(state);
+                        UpdateDynamicOccluders(g_worldState);
+                    }
+                    if (be > 0x10000 && sessionGeneration == gen) {
+                        auto plots = std::make_shared<RobRunWorld::PlotState>();
+                        if (RobRunWorld::ReadPlots(be, *plots) && sessionGeneration == gen) {
+                            std::lock_guard<std::mutex> lock(g_worldMutex);
+                            g_plotState = std::move(plots);
+                        }
                     }
                 }
-            }
-            if (lc > 0x10000) {
-                auto inv = std::make_shared<RobRunInventory::State>();
-                if (RobRunInventory::Read(bm, lc, *inv, readCatalog.load())) {
-                    std::lock_guard<std::mutex> lock(g_worldMutex);
-                    g_inventoryState = std::move(inv);
+                if (lc > 0x10000 && sessionGeneration == gen) {
+                    auto inv = std::make_shared<RobRunInventory::State>();
+                    if (RobRunInventory::Read(bm, lc, *inv, readCatalog.load()) && sessionGeneration == gen) {
+                        std::lock_guard<std::mutex> lock(g_worldMutex);
+                        g_inventoryState = std::move(inv);
+                    }
                 }
+                // Session changed while we were reading — clear stale published state
+                if (sessionGeneration != gen) {
+                    DLOG("WorldWorker #%d: session changed mid-read (was %llu, now %llu)",
+                         wwCount, (unsigned long long)gen, (unsigned long long)sessionGeneration);
+                    std::lock_guard<std::mutex> lock(g_worldMutex);
+                    g_worldState = std::make_shared<RobRunWorld::State>();
+                    g_plotState = std::make_shared<RobRunWorld::PlotState>();
+                    g_inventoryState = std::make_shared<RobRunInventory::State>();
+                }
+            } catch (const std::exception& e) {
+                DLOG("WorldWorker EXCEPTION #%d: %s", wwCount, e.what());
+            } catch (...) {
+                DLOG("WorldWorker UNKNOWN EXCEPTION #%d", wwCount);
             }
             for (int i = 0; i < 25 && !g_worldWorkerStop.load(std::memory_order_relaxed); ++i)
                 Sleep(10);
@@ -990,12 +1122,7 @@ static std::string NormalizeRoleName(const std::string& raw)
     }
     if (lower.empty()) return {};
 
-    if (lower.find("crim") != std::string::npos ||
-        lower.find("rob") != std::string::npos ||
-        lower.find("thief") != std::string::npos ||
-        lower.find("bandit") != std::string::npos ||
-        lower.find("gang") != std::string::npos)
-        return "Criminal";
+    // Police first — "robbery" contains "rob" which would false-positive as Criminal
     if (lower.find("polic") != std::string::npos ||
         lower.find("cop") != std::string::npos ||
         lower.find("officer") != std::string::npos ||
@@ -1003,6 +1130,12 @@ static std::string NormalizeRoleName(const std::string& raw)
         lower.find("guard") != std::string::npos ||
         lower.find("sheriff") != std::string::npos)
         return "Police Officer";
+    if (lower.find("crim") != std::string::npos ||
+        lower.find("robber") != std::string::npos ||
+        lower.find("thief") != std::string::npos ||
+        lower.find("bandit") != std::string::npos ||
+        lower.find("gang") != std::string::npos)
+        return "Criminal";
     if (lower.find("civil") != std::string::npos ||
         lower.find("citizen") != std::string::npos ||
         lower.find("settler") != std::string::npos ||
@@ -1299,14 +1432,22 @@ static void ReadReloadAndKnockdownState(std::uintptr_t characterModel,
         }
     }
 
-    // 2) KnockdownModel._endTs (active while after the sentinel and now).
+    // 2) KnockdownModel._endTs (active while after the sentinel and now),
+    //    gated by KnockdownLeaveStateModel — once the leave phase starts
+    //    the player is getting up and should no longer count as knocked.
     const std::uintptr_t kdModel = ReadPtr(
         characterModel + rr::BattleCharacterModel::Knockdown);
     if (kdModel > 0x10000 && battleNowMs > 0) {
         const std::int64_t kdEndTs = ReadTimestampData(
             ReadPtr(kdModel + rr::KnockdownModel::EndTs));
-        if (kdEndTs > kSentinelTs && kdEndTs > battleNowMs)
-            entity.isKnockedDown = true;
+        if (kdEndTs > kSentinelTs && kdEndTs > battleNowMs) {
+            const std::uintptr_t leaveModel = ReadPtr(
+                characterModel + rr::BattleCharacterModel::KnockdownLeaveState);
+            const bool leaving = leaveModel > 0x10000 &&
+                RobRunMemory::ReadUInt8(leaveModel + rr::KnockdownLeaveStateModel::IsActive) != 0;
+            if (!leaving)
+                entity.isKnockedDown = true;
+        }
     }
 
     // 3) KnockoutModel (phase non-null, active endTs, surrendered / handcuffed).
@@ -1742,17 +1883,7 @@ static void RefreshParty(std::uintptr_t game, std::int32_t localId,
         }
     }
 
-    bool localPresent = false;
-    if (localPublicId > 0) {
-        localPresent = std::find(ids.publicIds.begin(), ids.publicIds.end(),
-            localPublicId) != ids.publicIds.end();
-    }
-    if (!localPresent && localId > 0) {
-        localPresent = std::find(ids.entityIds.begin(), ids.entityIds.end(),
-            localId) != ids.entityIds.end();
-    }
-
-    if (!any || !localPresent)
+    if (!any)
         ids = PartyMemberIds{};
     else
         ids.valid = true;
@@ -1784,6 +1915,7 @@ static void RevalidateSession()
         // the whole session on the first miss forces a full re-resolve and
         // drops every cached rig, which shows up as a skeleton stutter.
         if (++fingerprintFailures < 2) return;
+        DLOG("Fingerprint: sustained failure, resetting roots and metadata caches");
         ++failureCount;
         cachedGame = 0;
         cachedBattleModel = 0;
@@ -1794,20 +1926,71 @@ static void RevalidateSession()
         cachedLookDirDirect = 0;
         cachedPlayerRotationInput = 0;
         cachedUpdater = 0;
+        Il2Cpp::ResetCaches();
         fingerprintFailures = 0;
         return;
     }
     fingerprintFailures = 0;
     (void)Il2Cpp::VerifyAccessors();
 
-    if (cachedGame && !IsClass(cachedGame, "Game"))
+    if (cachedGame && !IsClass(cachedGame, "Game")) {
+        DLOG("GameRoot: class check failed for cachedGame=0x%llx", (unsigned long long)cachedGame);
         cachedGame = 0;
-    if (cachedBattleModel && !IsClass(cachedBattleModel, "BattleModel"))
+    }
+    if (cachedBattleModel && !IsClass(cachedBattleModel, "BattleModel")) {
+        DLOG("ReaderRoot: class check failed for BattleModel=0x%llx", (unsigned long long)cachedBattleModel);
         cachedBattleModel = 0;
-    if (cachedBattleEntities && !IsClass(cachedBattleEntities, "BattleEntitiesModel"))
+    }
+    if (cachedBattleEntities && !IsClass(cachedBattleEntities, "BattleEntitiesModel")) {
+        DLOG("ReaderRoot: class check failed for BattleEntitiesModel=0x%llx", (unsigned long long)cachedBattleEntities);
         cachedBattleEntities = 0;
-    if (cachedUpdater && !IsClass(cachedUpdater, "BattleEntitiesUpdater"))
+    }
+    if (cachedUpdater && !IsClass(cachedUpdater, "BattleEntitiesUpdater")) {
+        DLOG("ReaderRoot: class check failed for BattleEntitiesUpdater=0x%llx", (unsigned long long)cachedUpdater);
         cachedUpdater = 0;
+    }
+}
+
+static bool HideDefaultCrosshair(std::uintptr_t game)
+{
+    if (g_crosshairState.hidden)
+        return true;
+    const std::uintptr_t updater = FindActiveUpdaterByName(game, "PlayerAimPointerUpdater");
+    if (!updater || !IsClass(updater, "PlayerAimPointerUpdater"))
+        return false;
+
+    const std::uintptr_t original = ReadPtr(updater + 0xD8);
+    const std::uintptr_t screenOpenChecker = ReadPtr(updater + 0xB8);
+    if (original <= 0x10000 || !IsClass(screenOpenChecker, "ScreenOpenChecker"))
+        return false;
+
+    const std::uint32_t redirectFlag = RobRunMemory::ReadUInt32(screenOpenChecker + 0x14);
+    if (redirectFlag == 0)
+        return false;
+
+    if (!TargetProcess.Write(updater + 0xD8, screenOpenChecker))
+        return false;
+
+    g_crosshairState.updater  = updater;
+    g_crosshairState.original = original;
+    g_crosshairState.hidden   = true;
+    return true;
+}
+
+static bool RestoreDefaultCrosshair()
+{
+    if (!g_crosshairState.hidden)
+        return true;
+    if (g_crosshairState.updater <= 0x10000)
+        return false;
+
+    const bool restored = TargetProcess.Write(
+        g_crosshairState.updater + 0xD8,
+        g_crosshairState.original);
+
+    if (restored)
+        g_crosshairState = {};
+    return restored;
 }
 
 static void UpdateInternal()
@@ -1821,8 +2004,18 @@ static void UpdateInternal()
     fallbackViewProjection = Matrix4x4{};
     fallbackViewProjectionValid = false;
     poseFailureCount = 0;
+    boneTotalAcc = boneInvalidAcc = boneNormZeroAcc = boneNormBadAcc = 0;
+    bonePosInfAcc = boneChainDropAcc = 0;
+    poseScatterOkAcc = poseScatterFailAcc = poseFreshOkAcc = 0;
 
     if (!gaBase) { if (uiCount <= 3) DLOG("UpdateInternal #%d: no gaBase", uiCount); return; }
+
+    if ((uiCount % 200) == 1)
+        DLOG("UpdateInternal #%d: game=0x%llx bm=0x%llx be=0x%llx entities=%zu gen=%llu",
+             uiCount, (unsigned long long)cachedGame,
+             (unsigned long long)cachedBattleModel,
+             (unsigned long long)cachedBattleEntities,
+             entities.size(), (unsigned long long)sessionGeneration);
 
     ++updateCounter;
     if ((updateCounter % 120) == 0)
@@ -1837,9 +2030,10 @@ static void UpdateInternal()
             // on every pass.
             gameRetryCountdown = cachedGame ? 0 : 30;
             if (!cachedGame) {
-                // ~300 attempts × 30-pass backoff ≈ 5 minutes of total failure.
-                // The DTB may have gone stale; attempt a re-fix once.
+                if (gameResolveFails == 0)
+                    DLOG("GameRoot: GOM resolve failed, backing off");
                 if (++gameResolveFails >= 300) {
+                    DLOG("GameRoot: sustained failure (%d attempts), attempting CR3 fix", gameResolveFails);
                     gameResolveFails = 0;
                     TargetProcess.FixCr3();
                 }
@@ -1876,6 +2070,8 @@ static void UpdateInternal()
         cachedLocalCharacter = 0;
         NoteSessionState();
         ++failureCount;
+        DLOG("ReaderRoot: BattleModel lost, failures=%u game=0x%llx",
+             failureCount, (unsigned long long)cachedGame);
         return;
     }
 
@@ -1915,6 +2111,8 @@ static void UpdateInternal()
                 if (RobRunMemory::ReadString(idStr, wide)) {
                     std::string id = RobRunMemory::WideToUtf8(wide);
                     std::lock_guard<std::mutex> lk(locationMutex);
+                    if (id != cachedLocationId)
+                        DLOG("Location: '%s' -> '%s'", cachedLocationId.c_str(), id.c_str());
                     cachedLocationId = std::move(id);
                 }
             }
@@ -2503,13 +2701,382 @@ static void UpdateInternal()
         // snapshot; using it keeps "visible from the camera" in step with the
         // frame the overlay draws over.
         RobRunCamera::CameraState visCamera = cameraState;
-        {
-            std::lock_guard<std::mutex> lock(g_freshCameraMutex);
-            if (g_freshCamera.valid) visCamera = g_freshCamera;
-        }
+        RobRunCamera::CameraState freshVisCamera{};
+        if (GetFreshCamera(freshVisCamera)) visCamera = freshVisCamera;
         if (uiCount <= 3) DLOG("UpdateInternal #%d: entering entity detail loop", uiCount);
         int detailBudget = 8;
         const std::int64_t battleNowMs = ReadBattleNowMs(cachedBattleEntities);
+        const bool carCabinSolid = ConfigInstance.Player.CarCabinSolid;
+        CollisionBVH::DynamicOccluders dynCopy;
+        {
+            std::lock_guard<std::mutex> lock(g_dynOccludersMutex);
+            dynCopy = g_dynOccluders;
+        }
+
+        // --- Scatter-batched detail refresh ---
+        // Collect entities needing detail refresh, then read all their
+        // data in 4 scatter phases (4 DMA round-trips) instead of
+        // ~50 sequential reads per entity.
+        struct ScatterEnt {
+            std::size_t workIdx;
+            int entityId;
+            std::uintptr_t characterModel;
+            // phase 1: from characterModel
+            std::uintptr_t privateModel{};
+            std::uintptr_t data{};
+            std::uintptr_t isDeadWrapper{};
+            std::uintptr_t weaponReload{};
+            std::uintptr_t itemInHands{};
+            std::uintptr_t hasArmorWrapper{};
+            std::uintptr_t inVehicle{};
+            std::uintptr_t isBgReloadWrapper{};
+            std::uintptr_t playerRole{};
+            std::uintptr_t costModel{};
+            std::uintptr_t knockout{};
+            std::uintptr_t knockdown{};
+            std::uintptr_t kdLeaveModel{};
+            // phase 2: second level
+            std::uintptr_t healthModel{};
+            std::uintptr_t initArmorModel{};
+            std::uintptr_t staminaModel{};
+            std::uintptr_t common{};
+            std::uintptr_t vehicleWrapper{};
+            std::uintptr_t reloadState{};
+            std::uintptr_t reloadEndTsW{};
+            std::uintptr_t kdEndTsW{};
+            std::uintptr_t koPhase{};
+            std::uintptr_t koEndTsW{};
+            std::uint8_t   koSurrendered{};
+            std::uint8_t   koHandcuffed{};
+            std::uintptr_t weaponCurrent{};
+            // phase 3: third level + blocks
+            struct { std::uintptr_t hw; std::uintptr_t dw; std::int32_t maxAmt; std::int32_t critHp; } hb{};
+            std::uintptr_t staminaW{};
+            std::uintptr_t armorW{};
+            std::uintptr_t commonRole{};
+            std::uintptr_t firingW{};
+            std::uintptr_t sprintingW{};
+            std::uintptr_t crouchingW{};
+            std::uintptr_t deadCommonW{};
+            std::uintptr_t vehIdW{};
+            std::uintptr_t reloadDesc{};
+            std::uintptr_t koPhaseDesc{};
+            std::uintptr_t weaponData{};
+            struct { std::int32_t charInv, vehInv, charEquip, charInvCash, charInvItems; } costs{};
+            // phase 4: wrapper values
+            float healthVal{};
+            std::uint8_t deadVal{};
+            std::int32_t staminaVal{};
+            std::int32_t armorVal{};
+            std::uint8_t hasArmorVal{};
+            std::uint8_t firingVal{};
+            std::uint8_t sprintingVal{};
+            std::uint8_t crouchingVal{};
+            std::uint8_t deadCommonVal{};
+            std::int32_t vehIdCommon{};
+            std::int32_t vehIdRole{};
+            std::uint8_t bgReloadVal{};
+            std::int64_t reloadEndTs{};
+            std::int64_t kdEndTs{};
+            std::uint8_t kdLeaveActive{};
+            std::int64_t koEndTs{};
+            std::uintptr_t weaponDesc{};
+        };
+        ScatterEnt se[8];
+        int seCount = 0;
+        std::unordered_map<int, int> seIdx;
+        seIdx.reserve(8);
+        for (auto& w : work) {
+            if (!w.positionValid) continue;
+            auto& det = detailCache[w.entityId];
+            const bool modelChanged = det.characterModel != w.characterModel;
+            const bool expired = now - det.stamp > 500;
+            if (!modelChanged && !(expired && detailBudget > 0)) continue;
+            if (!modelChanged) --detailBudget;
+            if (modelChanged) {
+                det = DetailCacheEntry{};
+                det.characterModel = w.characterModel;
+                det.transform = w.transform;
+            }
+            det.stamp = now;
+            auto& s = se[seCount];
+            std::memset(&s, 0, sizeof(s));
+            s.workIdx = static_cast<std::size_t>(&w - work.data());
+            s.entityId = w.entityId;
+            s.characterModel = w.characterModel;
+            seIdx[w.entityId] = seCount;
+            ++seCount;
+            if (seCount >= 8) break;
+        }
+
+        if (seCount > 0) {
+            auto sc = TargetProcess.CreateScatterHandleCached();
+            if (sc) {
+                // Phase 1: characterModel-level pointers
+                for (int i = 0; i < seCount; ++i) {
+                    auto& s = se[i];
+                    const auto cm = s.characterModel;
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::PrivateModel, &s.privateModel, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::Data, &s.data, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::IsDeadWrapper, &s.isDeadWrapper, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::WeaponReload, &s.weaponReload, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::ItemInHands, &s.itemInHands, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::HasArmor, &s.hasArmorWrapper, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::InVehicle, &s.inVehicle, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::IsBackgroundReload, &s.isBgReloadWrapper, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::PlayerRole, &s.playerRole, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::RobberInventoryCost, &s.costModel, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::Knockout, &s.knockout, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::Knockdown, &s.knockdown, 8);
+                    TargetProcess.AddScatterReadRequest(sc, cm + rr::BattleCharacterModel::KnockdownLeaveState, &s.kdLeaveModel, 8);
+                }
+                if (!TargetProcess.ExecuteScatterReadCached(sc))
+                    DLOG("ScatterFail: detail phase 1 (seCount=%d)", seCount);
+
+                // Phase 2: second-level pointers
+                for (int i = 0; i < seCount; ++i) {
+                    auto& s = se[i];
+                    if (s.privateModel > 0x10000) {
+                        TargetProcess.AddScatterReadRequest(sc, s.privateModel + rr::BattleCharacterPrivateModel::HealthModel, &s.healthModel, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.privateModel + rr::BattleCharacterPrivateModel::InitArmorModel, &s.initArmorModel, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.privateModel + rr::BattleCharacterPrivateModel::Stamina, &s.staminaModel, 8);
+                    }
+                    if (s.data > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.data + rr::BattleData::Common, &s.common, 8);
+                    if (s.inVehicle > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.inVehicle + rr::InVehicleModel::EntityId, &s.vehicleWrapper, 8);
+                    if (s.weaponReload > 0x10000) {
+                        TargetProcess.AddScatterReadRequest(sc, s.weaponReload + rr::WeaponReloadModel::State, &s.reloadState, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.weaponReload + rr::WeaponReloadModel::EndTs, &s.reloadEndTsW, 8);
+                    }
+                    if (s.knockdown > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.knockdown + rr::KnockdownModel::EndTs, &s.kdEndTsW, 8);
+                    if (s.knockout > 0x10000) {
+                        TargetProcess.AddScatterReadRequest(sc, s.knockout + rr::KnockoutModel::Phase, &s.koPhase, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.knockout + rr::KnockoutModel::EndTs, &s.koEndTsW, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.knockout + rr::KnockoutModel::IsSurrendered, &s.koSurrendered, 1);
+                        TargetProcess.AddScatterReadRequest(sc, s.knockout + rr::KnockoutModel::IsHandcuffed, &s.koHandcuffed, 1);
+                    }
+                    if (s.itemInHands > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.itemInHands + rr::ItemInHandsModel::Current, &s.weaponCurrent, 8);
+                }
+                if (!TargetProcess.ExecuteScatterReadCached(sc))
+                    DLOG("ScatterFail: detail phase 2 (seCount=%d)", seCount);
+
+                // Phase 3: third-level pointers + block reads
+                for (int i = 0; i < seCount; ++i) {
+                    auto& s = se[i];
+                    if (s.healthModel > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.healthModel + rr::HealthModel::Health, &s.hb, sizeof(s.hb));
+                    if (s.staminaModel > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.staminaModel + rr::StaminaModel::Amount, &s.staminaW, 8);
+                    if (s.initArmorModel > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.initArmorModel + rr::InitArmorModel::Amount, &s.armorW, 8);
+                    if (s.common > 0x10000) {
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::Role, &s.commonRole, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::IsFiring, &s.firingW, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::IsSprinting, &s.sprintingW, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::IsCrouching, &s.crouchingW, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::IsDead, &s.deadCommonW, 8);
+                        TargetProcess.AddScatterReadRequest(sc, s.common + rr::CommonModel::VehicleEntityId, &s.vehIdW, 8);
+                    }
+                    if (s.reloadState > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.reloadState + rr::ReferenceData::Value, &s.reloadDesc, 8);
+                    if (s.koPhase > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.koPhase + rr::ReferenceData::Value, &s.koPhaseDesc, 8);
+                    if (s.weaponCurrent > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.weaponCurrent + rr::EquipItemModel::Data, &s.weaponData, 8);
+                    if (s.costModel > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.costModel + rr::RobberInventoryCostModel::CharacterInventory, &s.costs, sizeof(s.costs));
+                }
+                if (!TargetProcess.ExecuteScatterReadCached(sc))
+                    DLOG("ScatterFail: detail phase 3 (seCount=%d)", seCount);
+
+                // Phase 4: wrapper primitive values (all at +0x18)
+                constexpr std::uintptr_t V = rr::PrimitiveData::value;
+                for (int i = 0; i < seCount; ++i) {
+                    auto& s = se[i];
+                    if (s.hb.hw > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.hb.hw + V, &s.healthVal, 4);
+                    if (s.isDeadWrapper > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.isDeadWrapper + V, &s.deadVal, 1);
+                    if (s.staminaW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.staminaW + V, &s.staminaVal, 4);
+                    if (s.armorW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.armorW + V, &s.armorVal, 4);
+                    if (s.hasArmorWrapper > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.hasArmorWrapper + V, &s.hasArmorVal, 1);
+                    if (s.firingW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.firingW + V, &s.firingVal, 1);
+                    if (s.sprintingW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.sprintingW + V, &s.sprintingVal, 1);
+                    if (s.crouchingW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.crouchingW + V, &s.crouchingVal, 1);
+                    if (s.deadCommonW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.deadCommonW + V, &s.deadCommonVal, 1);
+                    if (s.vehIdW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.vehIdW + V, &s.vehIdCommon, 4);
+                    if (s.vehicleWrapper > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.vehicleWrapper + V, &s.vehIdRole, 4);
+                    if (s.isBgReloadWrapper > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.isBgReloadWrapper + V, &s.bgReloadVal, 1);
+                    if (s.reloadEndTsW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.reloadEndTsW + 0x18, &s.reloadEndTs, 8);
+                    if (s.kdEndTsW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.kdEndTsW + 0x18, &s.kdEndTs, 8);
+                    if (s.kdLeaveModel > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.kdLeaveModel + rr::KnockdownLeaveStateModel::IsActive, &s.kdLeaveActive, 1);
+                    if (s.koEndTsW > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.koEndTsW + 0x18, &s.koEndTs, 8);
+                    if (s.weaponData > 0x10000)
+                        TargetProcess.AddScatterReadRequest(sc, s.weaponData + rr::ReferenceData::Value, &s.weaponDesc, 8);
+                }
+                if (!TargetProcess.ExecuteScatterReadCached(sc))
+                    DLOG("ScatterFail: detail phase 4 (seCount=%d)", seCount);
+                TargetProcess.CloseScatterHandle(sc);
+            }
+
+            // Distribute scatter results into detail cache
+            constexpr std::int64_t kSentinelTs = 1767225600000LL;
+            for (int i = 0; i < seCount; ++i) {
+                auto& s = se[i];
+                auto& det = detailCache[s.entityId];
+
+                // isDead (top-level wrapper)
+                if (s.isDeadWrapper > 0x10000) det.isDead = s.deadVal != 0;
+
+                // Health
+                if (s.hb.hw > 0x10000 &&
+                    std::isfinite(s.healthVal) && s.healthVal >= 0.f && s.healthVal <= 100000.f) {
+                    det.health = s.healthVal;
+                    det.healthKnown = true;
+                }
+                if (s.hb.maxAmt > 0 && s.hb.maxAmt <= 100000)
+                    det.maxHealth = static_cast<float>(s.hb.maxAmt);
+                if (s.hb.critHp >= 0 && s.hb.critHp <= 100000)
+                    det.criticalHealth = static_cast<float>(s.hb.critHp);
+
+                // Stamina / Armor
+                if (s.staminaW > 0x10000) det.stamina = static_cast<float>(s.staminaVal);
+                if (s.armorW > 0x10000) {
+                    det.armor = static_cast<float>(s.armorVal);
+                    if (s.armorVal > 0) det.hasArmor = true;
+                }
+
+                // Common state flags (overrides armor hasArmor)
+                if (s.firingW > 0x10000) det.isFiring = s.firingVal != 0;
+                if (s.sprintingW > 0x10000) det.isSprinting = s.sprintingVal != 0;
+                if (s.crouchingW > 0x10000) det.isCrouching = s.crouchingVal != 0;
+                if (s.deadCommonW > 0x10000 && s.deadCommonVal != 0) det.isDead = true;
+                if (s.hasArmorWrapper > 0x10000) det.hasArmor = s.hasArmorVal != 0;
+
+                // Vehicle (from ReadRoleAndVehicle path)
+                if (s.vehicleWrapper > 0x10000 && s.vehIdRole > 0) {
+                    det.inVehicle = true;
+                    det.vehicleId = s.vehIdRole;
+                }
+                // Vehicle (from ReadCommonState path, takes priority)
+                if (s.vehIdW > 0x10000) {
+                    det.inVehicle = s.vehIdCommon > 0;
+                    det.vehicleId = s.vehIdCommon > 0 ? s.vehIdCommon : 0;
+                }
+
+                // Role (sequential — uses cache, usually hits)
+                EntityData roleScratch{};
+                ApplyRoleFromWrapper(s.playerRole, roleScratch);
+                if (roleScratch.roleName.empty() && roleScratch.role == 0)
+                    ApplyRoleFromWrapper(s.commonRole, roleScratch);
+                if (roleScratch.role != 0) det.role = roleScratch.role;
+                if (!roleScratch.roleName.empty()) det.roleName = std::move(roleScratch.roleName);
+
+                // Reload
+                det.isReloading = false;
+                det.reloadPhase.clear();
+                if (s.reloadDesc > 0x10000) {
+                    det.isReloading = true;
+                    const std::uintptr_t nameStr = ReadPtr(s.reloadDesc + rr::Description::Name);
+                    if (nameStr > 0x10000) {
+                        std::wstring w;
+                        RobRunMemory::ReadString(nameStr, w);
+                        det.reloadPhase = RobRunMemory::WideToUtf8(w);
+                    }
+                }
+                if (!det.isReloading && battleNowMs > 0 &&
+                    s.reloadEndTs > kSentinelTs && s.reloadEndTs > battleNowMs)
+                    det.isReloading = true;
+                if (!det.isReloading && s.bgReloadVal != 0)
+                    det.isReloading = true;
+
+                // Knockdown
+                det.isKnockedDown = false;
+                if (battleNowMs > 0 && s.kdEndTs > kSentinelTs && s.kdEndTs > battleNowMs &&
+                    s.kdLeaveActive == 0)
+                    det.isKnockedDown = true;
+
+                // Knockout
+                det.isKnockedOut = false;
+                if (s.koPhaseDesc > 0x10000)
+                    det.isKnockedOut = true;
+                else if (battleNowMs > 0 && s.koEndTs > kSentinelTs && s.koEndTs > battleNowMs)
+                    det.isKnockedOut = true;
+                det.isSurrendered = s.koSurrendered != 0;
+                det.isHandcuffed = s.koHandcuffed != 0;
+
+                if (det.isKnockedOut && s.entityId == localEntityId &&
+                    ConfigInstance.Aim.IgnoreKnock && s.knockout > 0x10000) {
+                    std::uintptr_t zero = 0;
+                    TargetProcess.Write(
+                        s.knockout + rr::KnockoutModel::Phase, zero);
+                }
+
+                // Weapon (uses cache — only reads strings on miss)
+                if (s.weaponDesc > 0x10000) {
+                    const auto wit = g_weaponDescCache.find(s.weaponDesc);
+                    if (wit != g_weaponDescCache.end() && wit->second.valid) {
+                        det.weaponName = wit->second.name;
+                        det.weaponIndex = wit->second.index;
+                    } else {
+                        const std::uintptr_t nameStr = ReadPtr(s.weaponDesc + rr::Description::Name);
+                        std::wstring wn;
+                        if (nameStr > 0x10000) RobRunMemory::ReadString(nameStr, wn);
+                        if (!wn.empty()) {
+                            std::wstring cleaned = CleanWeaponName(wn);
+                            if (!cleaned.empty()) wn = std::move(cleaned);
+                        }
+                        const std::int32_t idx = RobRunMemory::ReadInt32(
+                            s.weaponDesc + rr::InventoryItemDescription::Index);
+                        det.weaponName = wn;
+                        det.weaponIndex = idx >= 0 ? idx : -1;
+                        if (!wn.empty() || idx >= 0)
+                            g_weaponDescCache[s.weaponDesc] = WeaponDescCache{ wn, det.weaponIndex, true };
+                    }
+                } else {
+                    det.weaponName.clear();
+                    det.weaponIndex = -1;
+                }
+
+                // Slot identity (sequential, cached)
+                if (det.publicId == 0 || det.nickname.empty()) {
+                    const auto slotIt = slots.find(s.entityId);
+                    if (slotIt != slots.end()) {
+                        EntityData slotScratch{};
+                        ReadSlotIdentity(slotIt->second, slotScratch);
+                        det.nickname = std::move(slotScratch.nickname);
+                        det.clanTag = std::move(slotScratch.clanTag);
+                        det.publicId = slotScratch.publicId;
+                    }
+                }
+
+                // Cost block (already scatter-read)
+                if (s.costModel > 0x10000) {
+                    det.bagValue = s.costs.charInv;
+                    det.bagCash = s.costs.charInvCash;
+                    det.bagItems = s.costs.charInvItems;
+                    det.equipValue = s.costs.charEquip;
+                }
+            }
+        }
+
         for (auto& w : work) {
             if (!w.positionValid) continue;
             if (uiCount <= 3) DLOG("UpdateInternal #%d: entity id=%d, cp=A (init)", uiCount, w.entityId);
@@ -2530,92 +3097,6 @@ static void UpdateInternal()
 
             if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B (detail cache)", uiCount);
             auto& detail = detailCache[entity.entityId];
-            const bool detailModelChanged =
-                detail.characterModel != w.characterModel;
-            const bool detailExpired = now - detail.stamp > 500;
-            if (detailModelChanged ||
-                (detailExpired && detailBudget > 0))
-            {
-                if (!detailModelChanged) --detailBudget;
-                if (detailModelChanged) {
-                    detail = DetailCacheEntry{};
-                    detail.characterModel = w.characterModel;
-                    detail.transform = w.transform;
-                }
-                detail.stamp = now;
-
-                EntityData scratch{};
-                scratch.entityId = entity.entityId;
-
-                const std::uintptr_t deadWrapper = ReadPtr(
-                    w.characterModel + rr::BattleCharacterModel::IsDeadWrapper);
-                bool dead = false;
-                if (Il2Cpp::ReadPrimitiveBool(deadWrapper, dead))
-                    detail.isDead = dead;
-
-                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B1 (isDead done)", uiCount);
-                ReadHealth(w.characterModel, scratch);
-                detail.health = scratch.health;
-                detail.maxHealth = scratch.maxHealth;
-                detail.criticalHealth = scratch.criticalHealth;
-                detail.healthKnown = scratch.healthKnown;
-                detail.armor = scratch.armor;
-                detail.stamina = scratch.stamina;
-
-                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B2 (health done)", uiCount);
-                scratch.isDead = detail.isDead;
-                ReadRoleAndVehicle(w.characterModel, scratch);
-                ReadCommonState(w.characterModel, scratch);
-                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B3 (role+common done)", uiCount);
-                ReadReloadAndKnockdownState(w.characterModel, battleNowMs, scratch);
-                detail.isReloading = scratch.isReloading;
-                detail.isKnockedDown = scratch.isKnockedDown;
-                detail.isKnockedOut = scratch.isKnockedOut;
-                detail.isSurrendered = scratch.isSurrendered;
-                detail.isHandcuffed = scratch.isHandcuffed;
-                detail.reloadPhase = std::move(scratch.reloadPhase);
-                detail.isDead = scratch.isDead;
-                detail.isSprinting = scratch.isSprinting;
-                detail.isCrouching = scratch.isCrouching;
-                detail.hasArmor = scratch.hasArmor;
-                detail.isFiring = scratch.isFiring;
-                if (scratch.role != 0) detail.role = scratch.role;
-                if (!scratch.roleName.empty()) detail.roleName = std::move(scratch.roleName);
-                detail.inVehicle = scratch.inVehicle;
-                detail.vehicleId = scratch.vehicleId;
-
-                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B4 (reload+knockdown done)", uiCount);
-                ReadWeaponName(w.characterModel, detail.weaponName, detail.weaponIndex);
-
-                if (uiCount <= 3) DLOG("UpdateInternal #%d: cp=B5 (weapon done)", uiCount);
-                if (detail.publicId == 0 || detail.nickname.empty()) {
-                    const auto slotIt = slots.find(w.entityId);
-                    if (slotIt != slots.end()) {
-                        ReadSlotIdentity(slotIt->second, scratch);
-                        detail.nickname = std::move(scratch.nickname);
-                        detail.clanTag = std::move(scratch.clanTag);
-                        detail.publicId = scratch.publicId;
-                    }
-                }
-
-                const std::uintptr_t costModel = ReadPtr(
-                    w.characterModel + rr::BattleCharacterModel::RobberInventoryCost);
-                if (costModel > 0x10000) {
-                    struct CostBlock {
-                        std::int32_t characterInventory;
-                        std::int32_t vehicleInventory;
-                        std::int32_t characterEquip;
-                        std::int32_t characterInventoryCash;
-                        std::int32_t characterInventoryItems;
-                    } costs{};
-                    if (RobRunMemory::ReadBytes(costModel + rr::RobberInventoryCostModel::CharacterInventory, &costs, sizeof(costs))) {
-                        detail.bagValue = costs.characterInventory;
-                        detail.bagCash = costs.characterInventoryCash;
-                        detail.bagItems = costs.characterInventoryItems;
-                        detail.equipValue = costs.characterEquip;
-                    }
-                }
-            }
 
             entity.isDead = detail.isDead;
             entity.health = detail.health;
@@ -2633,6 +3114,10 @@ static void UpdateInternal()
             entity.publicId = detail.publicId;
             entity.isPartyMember = IsPartyMember(entity.entityId, entity.publicId);
             entity.weaponName = detail.weaponName;
+            // Built once here (worker pass) instead of on every ESP frame.
+            entity.nicknameUtf8 = RobRunMemory::WideToUtf8(entity.nickname);
+            entity.clanTagUtf8 = RobRunMemory::WideToUtf8(entity.clanTag);
+            entity.weaponNameUtf8 = RobRunMemory::WideToUtf8(entity.weaponName);
             entity.weaponIndex = detail.weaponIndex;
             entity.isFiring = detail.isFiring;
             entity.isReloading = detail.isReloading;
@@ -2662,22 +3147,42 @@ static void UpdateInternal()
             try {
             if (w.needsPose) {
                 static bool loggedPose = false;
-                rig.curLocal.resize(static_cast<std::size_t>(rig.layout.count));
-                rig.worldMatrices.resize(static_cast<std::size_t>(rig.layout.count));
                 if (!loggedPose) {
                     DLOG("RobRunReader: needsPose, layout.count=%d, poseOffset=%zu, poseSize=%zu",
                         rig.layout.count, (size_t)w.poseOffset, (size_t)w.poseSize);
                 }
+
+                // Sample into temporaries so a failed read never
+                // overwrites the last good frame (async DMA flicker fix).
+                std::vector<Skeleton::BoneSegment> tmpBones;
+                Skeleton::BonePoints tmpPoints{};
+                std::vector<Skeleton::BoneLocal> tmpLocal(static_cast<std::size_t>(rig.layout.count));
+                std::vector<Matrix4x4> tmpWorld(static_cast<std::size_t>(rig.layout.count));
+
+                Skeleton::PoseStats pst{};
                 bool sampled = Skeleton::ProcessPoseData(rig.layout,
                     poseBuf.data() + w.poseOffset, w.poseSize,
-                    rig.bones, &rig.points, rig.curLocal.data(),
-                    rig.worldMatrices.data());
+                    tmpBones, &tmpPoints, tmpLocal.data(),
+                    tmpWorld.data(), &pst);
 
-                if (!sampled) {
+                if (sampled) {
+                    ++poseScatterOkAcc;
+                } else {
+                    ++poseScatterFailAcc;
+                    pst = {};
+                    tmpLocal.assign(static_cast<std::size_t>(rig.layout.count), Skeleton::BoneLocal{});
+                    tmpWorld.assign(static_cast<std::size_t>(rig.layout.count), Matrix4x4{});
                     sampled = Skeleton::SampleLayout(rig.layout, DmaReadFresh,
-                        rig.bones, &rig.points, rig.curLocal.data(),
-                        rig.worldMatrices.data());
+                        tmpBones, &tmpPoints, tmpLocal.data(),
+                        tmpWorld.data(), &pst);
+                    if (sampled) ++poseFreshOkAcc;
                 }
+                boneTotalAcc += pst.total;
+                boneInvalidAcc += pst.invalid;
+                boneNormZeroAcc += pst.normZero;
+                boneNormBadAcc += pst.normBad;
+                bonePosInfAcc += pst.posInf;
+                boneChainDropAcc += pst.chainDrop;
                 if (!loggedPose) {
                     DLOG("RobRunReader: pose sampled=%d, worldMatrices.size=%zu",
                         sampled, rig.worldMatrices.size());
@@ -2689,11 +3194,8 @@ static void UpdateInternal()
                         rig.poseFailureSince = now;
                     ++rig.poseFailures;
                     ++poseFailureCount;
-                    // A pose that cannot be read means the matrix array moved
-                    // (or the character was pooled). Drop the layout so the
-                    // next pass rebuilds; keep the last bones until the
-                    // hierarchy has been unreadable for a while, so a single
-                    // bad read never blanks the skeleton.
+                    // Failed read: keep drawing from cached bones.
+                    // Only drop layout after sustained failure.
                     if (!Skeleton::ValidateHierarchy(rig.layout, DmaReadFresh) ||
                         now - rig.poseFailureSince >= 350) {
                         rig.layoutValid = false;
@@ -2707,6 +3209,11 @@ static void UpdateInternal()
                         rig.smoothedWorldMatrices.clear();
                     }
                 } else {
+                    // Commit the good frame.
+                    rig.bones = std::move(tmpBones);
+                    rig.points = tmpPoints;
+                    rig.curLocal = std::move(tmpLocal);
+                    rig.worldMatrices = std::move(tmpWorld);
                     rig.poseFailures = 0;
                     rig.poseFailureSince = 0;
                     constexpr float kPosEpsSq  = 1.0e-6f;
@@ -2756,24 +3263,21 @@ static void UpdateInternal()
                     rig.prevLocal.swap(rig.curLocal);
                     rig.prevLocalValid = true;
 
-                    // Vehicles & moving players: bypass exponential smoothing when moving (> 0.05m / pass, ~1.5 m/s)
-                    // so the skeleton never trails behind running models. Stationary players retain smoothing to damp DMA jitter.
-                    const bool isFastMoving = entity.inVehicle ||
-                        (Distance(rig.lastSampledPos, entity.position) > 0.05f);
+                    // Velocity-adaptive smoothing: smoothly scale alpha with movement distance
+                    // to prevent binary toggle chatter while snapping on high-speed displacement / vehicles.
+                    const float moveDist = Distance(rig.lastSampledPos, entity.position);
                     rig.lastSampledPos = entity.position;
+                    const bool snapPose = entity.inVehicle || (moveDist > 0.40f);
 
                     // Exponential smoothing on the worker. PoseSmoothAlpha is
-                    // the weight of the new sample: 1 publishes the raw pose,
+                    // the base weight of the new sample: 1 publishes the raw pose,
                     // lower values damp the per-frame jitter that partial or
-                    // stale DMA reads add to the sample. Doing it here (and
-                    // drawing the result directly) means the overlay never
-                    // extrapolates past the newest pose, which is what made
-                    // the old render-side blend shake.
-                    if (!isFastMoving && ConfigInstance.Player.PoseSmoothing && rig.smoothedValid &&
+                    // stale DMA reads add to the sample.
+                    if (!snapPose && ConfigInstance.Player.PoseSmoothing && rig.smoothedValid &&
                         rig.smoothedBones.size() == rig.bones.size() &&
                         (rig.worldMatrices.empty() || rig.smoothedWorldMatrices.size() == rig.worldMatrices.size())) {
-                        const float alpha = std::clamp(
-                            ConfigInstance.Player.PoseSmoothAlpha, 0.1f, 1.0f);
+                        const float baseAlpha = std::clamp(ConfigInstance.Player.PoseSmoothAlpha, 0.10f, 1.0f);
+                        const float alpha = std::clamp(baseAlpha + (moveDist / 0.15f) * (1.0f - baseAlpha), 0.15f, 1.0f);
                         const float inv = 1.0f - alpha;
                         for (std::size_t i = 0; i < rig.bones.size(); ++i) {
                             auto& s = rig.smoothedBones[i];
@@ -2782,6 +3286,8 @@ static void UpdateInternal()
                             const float dbx = r.b.x-s.b.x, dby = r.b.y-s.b.y, dbz = r.b.z-s.b.z;
                             if (dax*dax+day*day+daz*daz > 0.25f ||
                                 dbx*dbx+dby*dby+dbz*dbz > 0.25f) {
+                                s.a = r.a;
+                                s.b = r.b;
                                 s.visible = r.visible;
                                 continue;
                             }
@@ -2795,7 +3301,10 @@ static void UpdateInternal()
                         }
                         auto lerpVec = [&](Skeleton::Vec& dst, const Skeleton::Vec& src) {
                             const float dx = src.x-dst.x, dy = src.y-dst.y, dz = src.z-dst.z;
-                            if (dx*dx+dy*dy+dz*dz > 0.25f) return;
+                            if (dx*dx+dy*dy+dz*dz > 0.25f) {
+                                dst = src;
+                                return;
+                            }
                             dst.x = dst.x * inv + src.x * alpha;
                             dst.y = dst.y * inv + src.y * alpha;
                             dst.z = dst.z * inv + src.z * alpha;
@@ -2828,7 +3337,10 @@ static void UpdateInternal()
                             const float dx = rm.matrix[3][0]-sm.matrix[3][0];
                             const float dy = rm.matrix[3][1]-sm.matrix[3][1];
                             const float dz = rm.matrix[3][2]-sm.matrix[3][2];
-                            if (dx*dx+dy*dy+dz*dz > 0.25f) continue;
+                            if (dx*dx+dy*dy+dz*dz > 0.25f) {
+                                sm = rm;
+                                continue;
+                            }
                             for (int r = 0; r < 4; ++r) {
                                 for (int c = 0; c < 4; ++c) {
                                     sm.matrix[r][c] = sm.matrix[r][c] * inv + rm.matrix[r][c] * alpha;
@@ -2892,7 +3404,16 @@ static void UpdateInternal()
             // the aim gate when every bone is occluded. Both need the BVH, so
             // without it the animator fallback above stays in effect and the
             // menu says the occluder file is missing.
-            if ((ConfigInstance.Player.VisCheck || ConfigInstance.Player.WallCheck || ConfigInstance.Aim.VisibleBonesOnly) &&
+            // Distance gate per item 9:
+            const bool haveLocalPos = RobRunMemory::Finite(localPosition) && !localPosition.IsZero();
+            const float entDist = haveLocalPos ? Distance(entity.position, localPosition) : 0.f;
+            if (ConfigInstance.Player.VisMaxDistance > 0.f && entDist > ConfigInstance.Player.VisMaxDistance) {
+                entity.visible = false;
+                for (auto& seg : entity.bones) {
+                    seg.visible = false;
+                }
+            }
+            else if ((ConfigInstance.Player.VisCheck || ConfigInstance.Player.WallCheck || ConfigInstance.Aim.VisibleBonesOnly) &&
                 g_bvhScene.valid && visCamera.valid &&
                 entity.entityId != localEntityId)
             {
@@ -2900,20 +3421,12 @@ static void UpdateInternal()
                     visCamera.position.x,
                     visCamera.position.y,
                     visCamera.position.z };
+
                 bool anyVisible = false;
-                if (!entity.bones.empty()) {
-                    for (auto& seg : entity.bones) {
-                        const CollisionBVH::Float3 mid = {
-                            (seg.a.x + seg.b.x) * 0.5f,
-                            (seg.a.y + seg.b.y) * 0.5f,
-                            (seg.a.z + seg.b.z) * 0.5f };
-                        seg.visible = !CollisionBVH::IsOccluded(g_bvhScene, cam, mid);
-                        if (seg.visible)
-                            anyVisible = true;
-                    }
-                } else {
-                    // Fallback when entity lacks skeleton segments (rig not yet built or culled at distance):
-                    // Automatically cast rays to torso (y + halfHeight) and head (y + headHeight)
+                const int rayCount = ConfigInstance.Player.VisRayCount;
+
+                if (rayCount <= 2 || entity.bones.empty()) {
+                    // Level 1: 2 Rays (Torso + Head). Lowest CPU load.
                     const CollisionBVH::Float3 torso = {
                         entity.position.x,
                         entity.position.y + 0.95f,
@@ -2923,9 +3436,62 @@ static void UpdateInternal()
                         entity.position.y + 1.65f,
                         entity.position.z };
 
-                    bool torsoVis = !CollisionBVH::IsOccluded(g_bvhScene, cam, torso);
-                    bool headVis = !CollisionBVH::IsOccluded(g_bvhScene, cam, head);
+                    bool torsoVis = !CollisionBVH::IsOccluded(g_bvhScene, cam, torso, &dynCopy, carCabinSolid);
+                    bool headVis = !CollisionBVH::IsOccluded(g_bvhScene, cam, head, &dynCopy, carCabinSolid);
                     anyVisible = torsoVis || headVis;
+                    for (auto& seg : entity.bones) {
+                        seg.visible = anyVisible;
+                    }
+                } else if (rayCount <= 6) {
+                    // Level 2: 6 Rays (Head, Chest, Pelvis, Left Hand, Right Hand, Feet)
+                    const auto& bp = entity.bonePoints;
+                    const CollisionBVH::Float3 pHead = bp.hasHead ?
+                        CollisionBVH::Float3{ bp.head.x, bp.head.y, bp.head.z } :
+                        CollisionBVH::Float3{ entity.position.x, entity.position.y + 1.70f, entity.position.z };
+                    const CollisionBVH::Float3 pChest = bp.hasChest ?
+                        CollisionBVH::Float3{ bp.chest.x, bp.chest.y, bp.chest.z } :
+                        CollisionBVH::Float3{ entity.position.x, entity.position.y + 1.25f, entity.position.z };
+                    const CollisionBVH::Float3 pPelvis = bp.hasPelvis ?
+                        CollisionBVH::Float3{ bp.pelvis.x, bp.pelvis.y, bp.pelvis.z } :
+                        CollisionBVH::Float3{ entity.position.x, entity.position.y + 0.85f, entity.position.z };
+                    const CollisionBVH::Float3 pLHand = (std::abs(bp.leftHand.x) > 0.01f) ?
+                        CollisionBVH::Float3{ bp.leftHand.x, bp.leftHand.y, bp.leftHand.z } :
+                        CollisionBVH::Float3{ entity.position.x - 0.40f, entity.position.y + 1.0f, entity.position.z };
+                    const CollisionBVH::Float3 pRHand = (std::abs(bp.rightHand.x) > 0.01f) ?
+                        CollisionBVH::Float3{ bp.rightHand.x, bp.rightHand.y, bp.rightHand.z } :
+                        CollisionBVH::Float3{ entity.position.x + 0.40f, entity.position.y + 1.0f, entity.position.z };
+                    const CollisionBVH::Float3 pFeet = { entity.position.x, entity.position.y + 0.15f, entity.position.z };
+
+                    bool vHead   = !CollisionBVH::IsOccluded(g_bvhScene, cam, pHead, &dynCopy, carCabinSolid);
+                    bool vChest  = !CollisionBVH::IsOccluded(g_bvhScene, cam, pChest, &dynCopy, carCabinSolid);
+                    bool vPelvis = !CollisionBVH::IsOccluded(g_bvhScene, cam, pPelvis, &dynCopy, carCabinSolid);
+                    bool vLHand  = !CollisionBVH::IsOccluded(g_bvhScene, cam, pLHand, &dynCopy, carCabinSolid);
+                    bool vRHand  = !CollisionBVH::IsOccluded(g_bvhScene, cam, pRHand, &dynCopy, carCabinSolid);
+                    bool vFeet   = !CollisionBVH::IsOccluded(g_bvhScene, cam, pFeet, &dynCopy, carCabinSolid);
+
+                    anyVisible = (vHead || vChest || vPelvis || vLHand || vRHand || vFeet);
+
+                    for (auto& seg : entity.bones) {
+                        const CollisionBVH::Float3 mid = {
+                            (seg.a.x + seg.b.x) * 0.5f,
+                            (seg.a.y + seg.b.y) * 0.5f,
+                            (seg.a.z + seg.b.z) * 0.5f };
+                        if (mid.y >= entity.position.y + 1.40f) seg.visible = vHead;
+                        else if (mid.y >= entity.position.y + 1.05f) seg.visible = (vChest || vLHand || vRHand);
+                        else if (mid.y >= entity.position.y + 0.65f) seg.visible = vPelvis;
+                        else seg.visible = vFeet;
+                    }
+                } else {
+                    // Level 3: 18+ Rays (Full Rig segment evaluation for exact per-limb highlights)
+                    for (auto& seg : entity.bones) {
+                        const CollisionBVH::Float3 mid = {
+                            (seg.a.x + seg.b.x) * 0.5f,
+                            (seg.a.y + seg.b.y) * 0.5f,
+                            (seg.a.z + seg.b.z) * 0.5f };
+                        seg.visible = !CollisionBVH::IsOccluded(g_bvhScene, cam, mid, &dynCopy, carCabinSolid);
+                        if (seg.visible)
+                            anyVisible = true;
+                    }
                 }
                 entity.visible = anyVisible;
             }
@@ -2968,6 +3534,13 @@ static void UpdateInternal()
 
     // World and inventory reading runs on dedicated g_worldWorkerThread
     // so this player pose pass runs at full speed without latency spikes.
+
+    if (cachedGame > 0x10000) {
+        if (ConfigInstance.Aim.HideCrosshair)
+            HideDefaultCrosshair(cachedGame);
+        else
+            RestoreDefaultCrosshair();
+    }
 
     // A root change here means this pass rebuilt the scene identity. Bump the
     // generation so memory aim blocks writes while the new objects settle.
@@ -3063,6 +3636,18 @@ void SetReadCatalogEnabled(bool enabled) { readCatalog.store(enabled); }
 
 void RefreshCamera()
 {
+    // Both the render thread and the aim worker call this. Each call is a DMA
+    // device transaction, and the two consumers only need the newest camera, so
+    // collapse calls that land within 3 ms of each other. The loser simply uses
+    // the camera the winner just published.
+    static std::atomic<std::int64_t> lastRefreshUs{ 0 };
+    const std::int64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::int64_t previous = lastRefreshUs.load(std::memory_order_relaxed);
+    if (nowUs - previous < 3000) return;
+    if (!lastRefreshUs.compare_exchange_strong(previous, nowUs, std::memory_order_relaxed))
+        return;
+
     // Fast path: when the native camera was valid last frame, skip the
     // managed read entirely and scatter-read just view+projection in one
     // device transaction (~2ms instead of ~8ms).
@@ -3075,12 +3660,21 @@ void RefreshCamera()
         if (nativeWasValid) {
             CameraFinder::CameraData fast = CameraFinder::GetCameraMatricesFast();
             if (fast.valid) {
-                std::lock_guard<std::mutex> lock(g_nativeCameraMutex);
-                g_nativeViewProjectionValid = true;
-                g_nativeView = fast.view;
-                g_nativeProjection = fast.projection;
-                g_nativePositionError = -1.f;
-                g_nativeForwardDot = -1.f;
+                {
+                    std::lock_guard<std::mutex> lock(g_nativeCameraMutex);
+                    g_nativeViewProjectionValid = true;
+                    g_nativeView = fast.view;
+                    g_nativeProjection = fast.projection;
+                    g_nativePositionError = -1.f;
+                    g_nativeForwardDot = -1.f;
+                    // Keep the aim/occlusion origin glued to the rendered
+                    // camera too, not just the projection.
+                    g_nativeCameraPoseValid = !fast.position.IsZero();
+                    if (g_nativeCameraPoseValid) {
+                        g_nativeCameraPosition = fast.position;
+                        g_nativeCameraForward = fast.forward;
+                    }
+                }
                 return;
             }
         }
@@ -3122,7 +3716,42 @@ void RefreshCamera()
         }
         g_nativePositionError = native.positionError;
         g_nativeForwardDot = native.forwardDot;
+        g_nativeCameraPoseValid = native.valid && !native.position.IsZero();
+        if (g_nativeCameraPoseValid) {
+            g_nativeCameraPosition = native.position;
+            g_nativeCameraForward = native.forward;
+        }
     }
+}
+
+bool GetFreshCamera(RobRunCamera::CameraState& out)
+{
+    RobRunCamera::CameraState managed{};
+    {
+        std::lock_guard<std::mutex> lock(g_freshCameraMutex);
+        managed = g_freshCamera;
+    }
+
+    // The native camera is the one the frame was rendered with. When its pose
+    // is known it wins; the managed camera stays as the fallback (and supplies
+    // the FOV, which the native fast path does not re-read).
+    Vector3 nativePosition{};
+    Vector3 nativeForward{};
+    bool haveNativePose = false;
+    {
+        std::lock_guard<std::mutex> lock(g_nativeCameraMutex);
+        haveNativePose = g_nativeCameraPoseValid;
+        nativePosition = g_nativeCameraPosition;
+        nativeForward = g_nativeCameraForward;
+    }
+
+    out = managed;
+    if (haveNativePose) {
+        out.position = nativePosition;
+        out.forward = nativeForward;
+        out.valid = true;
+    }
+    return out.valid;
 }
 
 bool GetViewProjection(Matrix4x4& out, int screenWidth, int screenHeight)
@@ -3274,26 +3903,38 @@ const CollisionBVH::Scene& GetBvhScene()
     return g_bvhScene;
 }
 
-bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin)
+bool IsOccluded(const Vector3& origin, const Vector3& target, float tMin, bool checkDynamic)
 {
     if (!g_bvhScene.valid) return false;
     const CollisionBVH::Float3 o{ origin.x, origin.y, origin.z };
     const CollisionBVH::Float3 t{ target.x, target.y, target.z };
-    return CollisionBVH::IsOccluded(g_bvhScene, o, t, tMin);
+    CollisionBVH::DynamicOccluders dynCopy;
+    const CollisionBVH::DynamicOccluders* dyn = nullptr;
+    if (checkDynamic) {
+        std::lock_guard<std::mutex> lock(g_dynOccludersMutex);
+        dynCopy = g_dynOccluders;
+        dyn = &dynCopy;
+    }
+    return CollisionBVH::IsOccluded(g_bvhScene, o, t, dyn, ConfigInstance.Player.CarCabinSolid, tMin);
 }
 
-bool IsCameraOccluded(const Vector3& target, float tMin)
+bool IsCameraOccluded(const Vector3& target, float tMin, bool checkDynamic)
 {
     if (!g_bvhScene.valid) return false;
     RobRunCamera::CameraState cam = cameraState;
-    {
-        std::lock_guard<std::mutex> lock(g_freshCameraMutex);
-        if (g_freshCamera.valid) cam = g_freshCamera;
-    }
+    RobRunCamera::CameraState fresh{};
+    if (GetFreshCamera(fresh)) cam = fresh;
     if (!cam.valid) return false;
     const CollisionBVH::Float3 o{ cam.position.x, cam.position.y, cam.position.z };
     const CollisionBVH::Float3 t{ target.x, target.y, target.z };
-    return CollisionBVH::IsOccluded(g_bvhScene, o, t, tMin);
+    CollisionBVH::DynamicOccluders dynCopy;
+    const CollisionBVH::DynamicOccluders* dyn = nullptr;
+    if (checkDynamic) {
+        std::lock_guard<std::mutex> lock(g_dynOccludersMutex);
+        dynCopy = g_dynOccluders;
+        dyn = &dynCopy;
+    }
+    return CollisionBVH::IsOccluded(g_bvhScene, o, t, dyn, ConfigInstance.Player.CarCabinSolid, tMin);
 }
 
 } // namespace RobRunReader

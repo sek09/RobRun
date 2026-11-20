@@ -4,6 +4,7 @@
 #include "RobRunMemory.h"
 #include "Il2Cpp.h"
 #include "Memory.h"
+#include "DebugLog.h"
 #include <cmath>
 #include <functional>
 #include <unordered_map>
@@ -116,6 +117,16 @@ bool ReadInlineField(std::uintptr_t model, std::uintptr_t offset, Vector3& out)
     if (!RobRunMemory::ReadVector3(model + offset, out)) return false;
     return ValidPosition(out) &&
         (out.x != 0.f || out.y != 0.f || out.z != 0.f);
+}
+
+std::string ReadIdentifiedId(std::uintptr_t obj)
+{
+    if (obj <= 0x10000) return {};
+    const std::uintptr_t strObj = RobRunMemory::ReadPtr(obj + rr::IdentifiedBase::Id);
+    if (strObj <= 0x10000) return {};
+    std::wstring wide;
+    if (!RobRunMemory::ReadString(strObj, wide, 128)) return {};
+    return RobRunMemory::WideToUtf8(wide);
 }
 
 // Inline Vector3 stored on the model's description object.
@@ -292,7 +303,8 @@ void AddDictionaryDescriptionScatter(std::uintptr_t world, std::uintptr_t dictio
             entity.id = item.id;
             entity.kind = kind;
             entity.position = item.position;
-            entity.label = KindName(kind);
+            std::string name = ReadIdentifiedId(item.desc);
+            entity.label = name.empty() ? KindName(kind) : std::move(name);
             out.entities.push_back(std::move(entity));
             ++kindCounter;
             if (out.entities.size() >= 4096) break;
@@ -375,7 +387,13 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
         if (WorldLooksValid(candidate))
             world = candidate;
     }
-    if (world <= 0x10000) return false;
+    if (world <= 0x10000) {
+        static int failCount = 0;
+        if ((++failCount % 50) == 1)
+            DLOG("WorldRead: no valid world ptr (bm=0x%llx be=0x%llx) fails=%d",
+                 (unsigned long long)battleModel, (unsigned long long)battleEntities, failCount);
+        return false;
+    }
 
     out.worldPtr = world;
     out.valid = true;
@@ -419,11 +437,62 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
     // DroppedBag below would duplicate every bag and double the DMA traffic,
     // so the DroppedBag pass is the only reader for this offset.
 
+    const std::size_t staticLootStart = out.entities.size();
     AddDictionaryDescriptionScatter(world, rr::WorldEntitiesModel::StaticLootObjects, Kind::StaticLoot,
         rr::StaticLootObjectModel::Description, 0x30, out, out.loots);
 
+    const std::size_t randomLootStart = out.entities.size();
     AddDictionaryDescriptionScatter(world, rr::WorldEntitiesModel::RandomLootObjects, Kind::RandomLoot,
         rr::RandomLootObjectModel::Description, 0x24, out, out.loots);
+
+    // Enrich static loot labels with item names
+    // desc → delegate (Func) → target (closure) → item desc → Identified.Id
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::StaticLootObjects, entries)) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = staticLootStart; i < randomLootStart; ++i)
+                idx[out.entities[i].id] = i;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end()) continue;
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                    e.value + rr::StaticLootObjectModel::Description);
+                if (desc <= 0x10000) continue;
+                const std::uintptr_t func = RobRunMemory::ReadPtr(
+                    desc + rr::StaticLootObjectDescription::LootItemFunc);
+                if (func <= 0x10000) continue;
+                const std::uintptr_t closure = RobRunMemory::ReadPtr(func + 0x10);
+                if (closure <= 0x10000) continue;
+                const std::uintptr_t itemDesc = RobRunMemory::ReadPtr(closure + 0x10);
+                std::string name = ReadIdentifiedId(itemDesc);
+                if (!name.empty())
+                    out.entities[it->second].label = std::move(name);
+            }
+        }
+    }
+
+    // Enrich random loot labels with item names
+    // _item wrapper → item desc → Identified.Id
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::RandomLootObjects, entries)) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = randomLootStart; i < out.entities.size(); ++i)
+                idx[out.entities[i].id] = i;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end()) continue;
+                const std::uintptr_t wrapper = RobRunMemory::ReadPtr(
+                    e.value + rr::RandomLootObjectModel::Item);
+                if (wrapper <= 0x10000) continue;
+                const std::uintptr_t itemDesc = RobRunMemory::ReadPtr(wrapper + 0x18);
+                std::string name = ReadIdentifiedId(itemDesc);
+                if (!name.empty())
+                    out.entities[it->second].label = std::move(name);
+            }
+        }
+    }
 
     AddDictionary(world, rr::WorldEntitiesModel::Cars, Kind::Car,
         [](std::uintptr_t model, Vector3& position) {
@@ -519,6 +588,7 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
         rr::PlotContainerModel::Description, rr::PlotContainerModel::DescriptionPosition, out, out.containers);
 
     // --- New dump: dropped bags, vehicle loot, cargo and loose loot ----
+    const std::size_t droppedBagStart = out.entities.size();
     AddDictionary(world, rr::WorldEntitiesModel::DroppedLootBags, Kind::DroppedBag,
         [](std::uintptr_t model, Vector3& position) {
             const std::uintptr_t transform = RobRunMemory::ReadPtr(
@@ -527,8 +597,51 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
             return ReadInlineField(model, rr::DroppedBagModel::InteractPosition, position);
         }, out, out.loots);
 
+    // Label dropped bags by role (Robber Bag / Cop Bag)
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::DroppedLootBags, entries)) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = droppedBagStart; i < out.entities.size(); ++i)
+                idx[out.entities[i].id] = i;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end()) continue;
+                const std::uintptr_t roleW = RobRunMemory::ReadPtr(
+                    e.value + rr::DroppedBagModel::Role);
+                if (roleW <= 0x10000) continue;
+                const std::uintptr_t roleDesc = RobRunMemory::ReadPtr(roleW + 0x18);
+                std::string roleName = ReadIdentifiedId(roleDesc);
+                if (roleName.find("Police") != std::string::npos)
+                    out.entities[it->second].label = "Cop Bag";
+                else if (!roleName.empty())
+                    out.entities[it->second].label = "Robber Bag";
+            }
+        }
+    }
+
+    const std::size_t vehicleLootStart = out.entities.size();
     AddDictionaryInlineScatter(world, rr::WorldEntitiesModel::VehicleLoots, Kind::VehicleLoot,
         rr::VehicleLootModel::InteractPosition, out, out.loots);
+
+    // Flag vehicle loot that carries cargo
+    {
+        std::vector<RobRunMemory::DictEntry> entries;
+        if (ReadCollection(world, rr::WorldEntitiesModel::VehicleLoots, entries)) {
+            std::unordered_map<std::int32_t, std::size_t> idx;
+            for (std::size_t i = vehicleLootStart; i < out.entities.size(); ++i)
+                idx[out.entities[i].id] = i;
+            for (const auto& e : entries) {
+                auto it = idx.find(e.key);
+                if (it == idx.end()) continue;
+                const std::uintptr_t cargoW = RobRunMemory::ReadPtr(
+                    e.value + rr::VehicleLootModel::HasCargo);
+                bool hasCargo = false;
+                if (cargoW > 0x10000 && Il2Cpp::ReadPrimitiveBool(cargoW, hasCargo) && hasCargo)
+                    out.entities[it->second].label = "Vehicle Loot [C]";
+            }
+        }
+    }
 
     AddDictionary(world, rr::WorldEntitiesModel::Cargos, Kind::Cargo,
         [](std::uintptr_t model, Vector3& position) {
@@ -570,13 +683,17 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
                     hasCash = true;
                 }
 
+                const std::uintptr_t desc = RobRunMemory::ReadPtr(
+                    model + rr::CashLootNodeModel::Description);
+                std::string name = ReadIdentifiedId(desc);
+
                 Entity entity{};
                 entity.id = entry.key;
                 entity.kind = Kind::CashLootNode;
                 entity.position = position;
                 entity.cashAmount = cashAmount;
                 entity.hasCashAmount = hasCash;
-                entity.label = "Cash Node";
+                entity.label = name.empty() ? "Cash Node" : std::move(name);
                 out.entities.push_back(std::move(entity));
                 ++out.valuables;
                 if (out.entities.size() >= 4096) break;
@@ -809,6 +926,12 @@ bool Read(std::uintptr_t battleModel, std::uintptr_t battleEntities, State& out)
             }
         }
     }
+
+    static int readCount = 0;
+    if ((++readCount % 50) == 1)
+        DLOG("WorldRead #%d: world=0x%llx entities=%zu (cont=%d loot=%d veh=%d gren=%d)",
+             readCount, (unsigned long long)world, out.entities.size(),
+             out.containers, out.loots, out.vehicles, out.grenades);
 
     return out.valid;
 }
