@@ -224,7 +224,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 	callbacks.draw = [] {
 		static int frameCount = 0;
 		++frameCount;
-		if (frameCount <= 3 || (frameCount % 500) == 0)
+		if (frameCount <= 3)
 			DLOG("Draw frame #%d", frameCount);
 		try {
 			// Only draw game state while attached: during a reattach the reader

@@ -32,9 +32,6 @@ std::vector<RECT> g_monitors;
 int g_appliedMonitor = -1;
 
 bool g_menuOpen = true;
-bool g_transparent = false;
-bool g_clickThrough = true;
-bool g_alwaysOnTop = true;
 std::atomic<bool> g_requestExit{ false };
 
 #ifdef _DEBUG
@@ -121,7 +118,7 @@ void ApplyOverlayMonitor(HWND hWnd)
 	index = std::clamp(index, 0, (int)g_monitors.size() - 1);
 	if (index == g_appliedMonitor) return;
 	const RECT& r = g_monitors[index];
-	SetWindowPos(hWnd, g_alwaysOnTop ? HWND_TOPMOST : HWND_TOP,
+	SetWindowPos(hWnd, Overlay::AlwaysOnTop() ? HWND_TOPMOST : HWND_TOP,
 		r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE);
 	g_appliedMonitor = index;
 }
@@ -147,8 +144,8 @@ void ApplyOverlayPerPixelTransparency(HWND hwnd, bool transparent)
 
 void SyncOverlayWindowChrome(HWND hwnd)
 {
-	const bool clickThrough = g_clickThrough && !g_menuOpen;
-	const ChromeState wanted{ g_transparent, clickThrough, g_alwaysOnTop, true };
+	const bool clickThrough = Overlay::ClickThrough() && !g_menuOpen;
+	const ChromeState wanted{ Overlay::Transparent(), clickThrough, Overlay::AlwaysOnTop(), true };
 	if (g_appliedChrome.valid
 		&& g_appliedChrome.transparent == wanted.transparent
 		&& g_appliedChrome.clickThrough == wanted.clickThrough
@@ -167,7 +164,21 @@ void SyncOverlayWindowChrome(HWND hwnd)
 	g_appliedChrome = wanted;
 }
 
-void WaitForFrameCap()
+bool PumpWindowMessages()
+{
+	// Leave time to draw even if input or another window keeps posting messages.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+	MSG msg{};
+	while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		if (msg.message == WM_QUIT) return false;
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+		if (std::chrono::steady_clock::now() >= deadline) break;
+	}
+	return true;
+}
+
+void WaitForFrameCap(HANDLE frameTimer)
 {
 	using clock = std::chrono::steady_clock;
 	static clock::time_point next{};
@@ -200,13 +211,17 @@ void WaitForFrameCap()
 	if (remain <= clock::duration::zero())
 		return;
 
-	// timeBeginPeriod(1) is already active in the render loop, but sleep_for
-	// still rounds up to the timer tick. Sleep the bulk, then spin briefly so
-	// the cap is honoured within a frame at 240+ fps. The spin is kept to
-	// 200 us: a 1 ms spin at 144 fps burns roughly 14% of a core for nothing.
+	// A coarse sleep can consume nearly two 60 Hz frames when Windows rounds
+	// the wakeup to a timer tick. Keep only the final 200 us as a spin.
 	const auto spin = std::chrono::microseconds(200);
-	if (remain > spin)
-		std::this_thread::sleep_for(remain - spin);
+	if (remain > spin) {
+		const auto delay = remain - spin;
+		LARGE_INTEGER due{};
+		due.QuadPart = -std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(delay).count() / 100);
+		if (!frameTimer || !SetWaitableTimer(frameTimer, &due, 0, nullptr, nullptr, FALSE) ||
+			WaitForSingleObject(frameTimer, INFINITE) != WAIT_OBJECT_0)
+			std::this_thread::sleep_until(next - spin);
+	}
 	while (clock::now() < next) {
 		_mm_pause();
 	}
@@ -307,10 +322,10 @@ void DrawDebugOverlay()
 		(int)g_monitors.size());
 	line(buf, white);
 	std::snprintf(buf, sizeof(buf), "Menu: %s   Transparent: %s   Click-through: %s",
-		g_menuOpen ? "open" : "closed", g_transparent ? "on" : "off",
-		(g_clickThrough && !g_menuOpen) ? "on" : "off");
+		g_menuOpen ? "open" : "closed", Overlay::Transparent() ? "on" : "off",
+		(Overlay::ClickThrough() && !g_menuOpen) ? "on" : "off");
 	line(buf, white);
-	std::snprintf(buf, sizeof(buf), "Always on top: %s", g_alwaysOnTop ? "on" : "off");
+	std::snprintf(buf, sizeof(buf), "Always on top: %s", Overlay::AlwaysOnTop() ? "on" : "off");
 	line(buf, white);
 	if (g_status) {
 		const std::string status = g_status();
@@ -355,29 +370,26 @@ void TogglePanic()
 	}
 }
 
-bool Transparent() { return g_transparent; }
+bool Transparent() { return ConfigInstance.Overlay.Transparent; }
 
 void SetTransparent(bool on)
 {
-	g_transparent = on;
 	ConfigInstance.Overlay.Transparent = on;
 	g_appliedChrome.valid = false;
 }
 
-bool ClickThrough() { return g_clickThrough; }
+bool ClickThrough() { return ConfigInstance.Overlay.ClickThroughWhenClosed; }
 
 void SetClickThrough(bool on)
 {
-	g_clickThrough = on;
 	ConfigInstance.Overlay.ClickThroughWhenClosed = on;
 	g_appliedChrome.valid = false;
 }
 
-bool AlwaysOnTop() { return g_alwaysOnTop; }
+bool AlwaysOnTop() { return ConfigInstance.Overlay.AlwaysOnTop; }
 
 void SetAlwaysOnTop(bool on)
 {
-	g_alwaysOnTop = on;
 	ConfigInstance.Overlay.AlwaysOnTop = on;
 	g_appliedChrome.valid = false;
 }
@@ -459,9 +471,6 @@ int Run(HINSTANCE instance, const wchar_t* title, const wchar_t* windowClass,
 	const Callbacks& callbacks)
 {
 	g_status = callbacks.status;
-	g_transparent = ConfigInstance.Overlay.Transparent;
-	g_clickThrough = ConfigInstance.Overlay.ClickThroughWhenClosed;
-	g_alwaysOnTop = ConfigInstance.Overlay.AlwaysOnTop;
 	g_appliedChrome.valid = false;
 
 	ImGui_ImplWin32_EnableDpiAwareness();
@@ -546,16 +555,12 @@ int Run(HINSTANCE instance, const wchar_t* title, const wchar_t* windowClass,
 	ImGui_ImplDX11_Init(g_device, g_context);
 
 	const bool timerPeriodSet = timeBeginPeriod(1) == TIMERR_NOERROR;
+	HANDLE frameTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+		TIMER_MODIFY_STATE | SYNCHRONIZE);
 
-	MSG msg{};
-	while (msg.message != WM_QUIT)
+	while (true)
 	{
-		if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-			continue;
-		}
+		if (!PumpWindowMessages() || !IsWindow(hWnd)) break;
 
 		if (g_requestExit.exchange(false))
 		{
@@ -606,15 +611,16 @@ int Run(HINSTANCE instance, const wchar_t* title, const wchar_t* windowClass,
 		ImGui::Render();
 
 		const D2D1::ColorF& bg = ConfigInstance.Overlay.BackgroundColour;
-		const float clear[4] = { bg.r, bg.g, bg.b, g_transparent ? 0.f : 1.f };
+		const float clear[4] = { bg.r, bg.g, bg.b, Transparent() ? 0.f : 1.f };
 		g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
 		g_context->ClearRenderTargetView(g_rtv, clear);
 		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 		g_swapChain->Present(0, 0);
-		WaitForFrameCap();
+		WaitForFrameCap(frameTimer);
 	}
 
 	if (callbacks.shutdown) callbacks.shutdown();
+	if (frameTimer) CloseHandle(frameTimer);
 	if (timerPeriodSet) timeEndPeriod(1);
 	ImGui_ImplDX11_Shutdown();
 	ImGui_ImplWin32_Shutdown();

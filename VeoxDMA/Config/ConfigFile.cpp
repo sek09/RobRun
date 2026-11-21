@@ -13,6 +13,8 @@ const std::wstring kConfigDirW = L"C:\\VeoxDMA\\RobRun";
 const std::string kConfigDirA = "C:\\VeoxDMA\\RobRun";
 
 std::string g_activeConfig = "default";
+// A failed startup load must not let menu-close or exit autosave overwrite it.
+bool g_hasActiveProfile = false;
 wchar_t g_activeConfigPathW[1024] = {};
 
 void EnsureDirectoryExists()
@@ -50,12 +52,7 @@ std::string SanitizeName(std::string name)
 
 void UpdateActivePath()
 {
-    EnsureDirectoryExists();
-    std::string safeName = SanitizeName(g_activeConfig);
-    if (safeName.empty()) safeName = "default";
-
-    g_activeConfig = safeName;
-    std::wstring fullPath = kConfigDirW + L"\\" + std::wstring(safeName.begin(), safeName.end()) + L".json";
+    std::wstring fullPath = kConfigDirW + L"\\" + std::wstring(g_activeConfig.begin(), g_activeConfig.end()) + L".json";
     wcscpy_s(g_activeConfigPathW, fullPath.c_str());
 }
 
@@ -95,6 +92,7 @@ void SetActiveConfigName(const std::string& name)
         return;
     }
     g_activeConfig = safe;
+    g_hasActiveProfile = true;
     UpdateActivePath();
 }
 
@@ -115,34 +113,19 @@ std::vector<std::string> ListConfigs()
         }
     }
 
-    if (configs.empty())
-    {
-        configs.push_back("default");
-    }
-
     std::sort(configs.begin(), configs.end());
     return configs;
 }
 
-bool Save(const std::string& name)
+static bool WriteProfile(const std::string& name, bool replaceExisting)
 {
     EnsureDirectoryExists();
-    std::string target = SanitizeName(name.empty() ? g_activeConfig : name);
-    if (target.empty()) {
-        if (!name.empty()) {
-            LOG("[Config] rejected config name '%s'\n", name.c_str());
-            return false;
-        }
-        target = "default";
-    }
-
-    g_activeConfig = target;
-    UpdateActivePath();
+    if (name.empty() && !g_hasActiveProfile) return false;
+    const std::string target = name.empty() ? g_activeConfig : SanitizeName(name);
+    if (target.empty()) return false;
 
     const std::filesystem::path fullPath =
         std::filesystem::path(kConfigDirW) / (target + ".json");
-    const std::filesystem::path tmpPath = fullPath.string() + ".tmp";
-
     // Serialize first: a throw here must leave the live file untouched.
     std::string text;
     try {
@@ -156,75 +139,73 @@ bool Save(const std::string& name)
     // Write a temp file, then rename over the target. A crash or power loss
     // mid-save then leaves the previous config intact instead of a truncated
     // file that fails to parse (and silently loads a different config).
+    // A separate temp file per writer also protects simultaneous creates
+    // from different running instances.
+    wchar_t tmpPath[MAX_PATH];
+    if (!GetTempFileNameW(kConfigDirW.c_str(), L"cfg", 0, tmpPath))
+        return false;
     {
-        std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            LOG("[Config] cannot open %ls for writing\n", tmpPath.c_str());
-            return false;
-        }
+        std::ofstream out(std::filesystem::path(tmpPath), std::ios::binary | std::ios::trunc);
         out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
+        out.close();
         if (!out.good()) {
-            LOG("[Config] write failed for %ls\n", tmpPath.c_str());
-            out.close();
-            std::error_code ignore;
-            std::filesystem::remove(tmpPath, ignore);
+            LOG("[Config] write failed for %ls\n", tmpPath);
+            DeleteFileW(tmpPath);
             return false;
         }
     }
 
-    // std::filesystem::rename replaces an existing destination. Retry a couple
-    // of times because an AV scanner can hold the file open briefly. Never
-    // delete the live config: if the swap fails, the old file must survive.
-    std::error_code ec;
+    // Create must reject an existing name at the instant of the rename.
+    const DWORD flags = replaceExisting ? MOVEFILE_REPLACE_EXISTING : 0;
+    DWORD error = ERROR_SUCCESS;
     for (int attempt = 0; attempt < 3; ++attempt) {
-        std::filesystem::rename(tmpPath, fullPath, ec);
-        if (!ec) break;
+        if (MoveFileExW(tmpPath, fullPath.c_str(), flags)) {
+            g_activeConfig = target;
+            g_hasActiveProfile = true;
+            UpdateActivePath();
+            return true;
+        }
+        error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION || attempt == 2) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (ec) {
-        LOG("[Config] rename %ls -> %ls failed: %s (previous config kept)\n",
-            tmpPath.c_str(), fullPath.c_str(), ec.message().c_str());
-        return false;
-    }
+    LOG("[Config] write to %ls failed (Windows error %lu)\n", fullPath.c_str(), error);
+    DeleteFileW(tmpPath);
+    return false;
+}
 
-    LOG("[Config] saved %ls\n", fullPath.c_str());
-    return true;
+bool Save(const std::string& name)
+{
+    return WriteProfile(name, true);
 }
 
 bool Load(const std::string& name)
 {
     EnsureDirectoryExists();
-    std::string target = SanitizeName(name.empty() ? g_activeConfig : name);
-    if (target.empty()) {
-        if (!name.empty()) {
-            LOG("[Config] rejected config name '%s'\n", name.c_str());
-            return false;
-        }
-        target = "default";
-    }
+    const std::string target = name.empty() ? g_activeConfig : SanitizeName(name);
+    if (target.empty()) return false;
 
     std::filesystem::path fullPath = std::filesystem::path(kConfigDirW) / (target + ".json");
     std::ifstream in(fullPath, std::ios::binary);
     if (!in) {
+        std::error_code ec;
+        if (!name.empty() || std::filesystem::exists(fullPath, ec) || ec)
+            return false;
         auto list = ListConfigs();
-        if (!list.empty()) {
-            fullPath = std::filesystem::path(kConfigDirW) / (list[0] + ".json");
-            target = list[0];
-            in.open(fullPath, std::ios::binary);
-        }
-        if (!in) {
-            LOG("[Config] %ls not found, initializing default\n", fullPath.c_str());
-            Save("default");
-            return true;
-        }
+        if (list.empty())
+            return CreateConfig("default");
+        return Load(list.front());
     }
 
     try {
         json parsed;
         in >> parsed;
-        ConfigInstance.FromJson(parsed);
+        if (!parsed.is_object()) return false;
+        auto candidate = ConfigInstance;
+        candidate.FromJson(parsed);
+        ConfigInstance = std::move(candidate);
         g_activeConfig = target;
+        g_hasActiveProfile = true;
         UpdateActivePath();
     }
     catch (const std::exception& e) {
@@ -238,12 +219,7 @@ bool Load(const std::string& name)
 
 bool CreateConfig(const std::string& name)
 {
-    const std::string safe = SanitizeName(name);
-    if (safe.empty()) {
-        LOG("[Config] rejected config name '%s'\n", name.c_str());
-        return false;
-    }
-    return Save(safe);
+    return !name.empty() && WriteProfile(name, false);
 }
 
 bool RenameConfig(const std::string& oldName, const std::string& newName)
@@ -295,13 +271,10 @@ bool DeleteConfig(const std::string& name)
     std::filesystem::remove(path, ec);
     if (ec) return false;
 
-    auto list = ListConfigs();
-    if (!list.empty())
-        Load(list[0]);
-    else
-        Save("default");
-
-    return true;
+    if (g_activeConfig != safe) return true;
+    g_hasActiveProfile = false;
+    const auto list = ListConfigs();
+    return list.empty() ? CreateConfig("default") : Load(list.front());
 }
 
 } // namespace ConfigFile
